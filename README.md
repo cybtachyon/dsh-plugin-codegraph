@@ -45,6 +45,8 @@ Two tools, deliberately separate.
 | `explore` | Several related declarations with their source | `query` |
 | `context` | Everything relevant to a task | `task` |
 
+`search` and `explore` parse their query the way the CLI's `query` does: a list of identifiers separated by whitespace, commas, or semicolons, each searched on its own and the results merged, so `GroupType hasPlugin` finds both; a member written `Class::member` or `Class.member` is split into its parts, so `Group.hasPermission` finds the class and the method. `node` and its friends take one symbol — a simple name, a member written `Class::member`, or the full qualified name a `search` returns — all of which resolve against an index that recorded the same declaration in any of the on-disk conventions (this plugin's `file::Class.member`, the CLI's `Namespace::Class::method`). A declaration the index does not store under any of those spellings is reported as not found, naming the symbol and the `search` call that lists the closest names.
+
 ### `codegraph_index` — build or refresh the graph
 
 Separate from `codegraph` rather than an eleventh operation, because indexing a large workspace takes minutes while a query takes milliseconds, and a tool's timeout budget is fixed per registration. Folding them together would force one budget that is either too tight for a real build or too loose to catch a hung query.

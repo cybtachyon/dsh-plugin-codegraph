@@ -41,6 +41,36 @@ export function taskTerms(task: string, maxTerms: number): string[] {
 }
 
 /**
+ * Split an explicit query into the terms to search for, one sub-query each.
+ *
+ * A query is a deliberate list of identifiers, not prose to distill, so unlike {@link taskTerms}
+ * nothing is filtered: a short or common word the model asked for is searched as asked, because an
+ * explicit query gets no stopwords and no minimum length. What it does do is split on whitespace,
+ * the separators models slip in (commas, semicolons), and the member delimiters themselves — a query
+ * written `Class::member` (or `Class.member`) becomes two sub-queries, `Class` and `member`, the
+ * same way the codegraph CLI's `query` treats them, so a query written in the model's notation finds
+ * a declaration the index recorded in its own. It also drops a word the same query already carried
+ * in another casing, since the index search is case-insensitive and a duplicate would only spend a
+ * query budget twice on the same match set.
+ * @param query - the raw query text.
+ * @param maxTerms - the largest number of terms to return, in the order the model wrote them.
+ * @returns the search terms; a single-word query without member delimiters returns that one term,
+ * which is the call shape a single-word query used to take, so single-word behaviour is unchanged.
+ */
+export function queryTerms(query: string, maxTerms: number): string[] {
+  const kept = new Map<string, string>()
+  for (const raw of query.split(/[\s,;]+/)) {
+    if (raw === '') continue
+    for (const part of raw.split(/::|[.#]/)) {
+      if (part === '') continue
+      const key = part.toLowerCase()
+      if (!kept.has(key)) kept.set(key, part)
+    }
+  }
+  return [...kept.values()].slice(0, maxTerms)
+}
+
+/**
  * Node kinds that name code without declaring any. An `import` node exists once per importing file,
  * so a widely used symbol contributes a dozen of them under its own name; a `file` node repeats the
  * path its results are already grouped by. `search` still returns both, because a model that asked
@@ -72,16 +102,15 @@ function nodeKey(node: CodegraphNode): string {
 }
 
 /**
- * Merge per-term search results into one ranked list.
+ * Merge per-term search results into one ranked list, untruncated.
  *
  * A declaration found by several of a task's terms is more likely to be what the task is about than
  * one found by a single term, so hit count leads the ranking; within an equal count the earliest
  * position any single search gave it wins, preserving the store's own relevance order.
  * @param batches - each term's search results, in the order the store ranked them.
- * @param limit - largest number of declarations to return.
- * @returns the merged declarations, most relevant first.
+ * @returns every matched declaration with its hit count, most relevant first, before any limit.
  */
-export function mergeByHits(batches: readonly (readonly CodegraphNode[])[], limit: number): ScoredNode[] {
+export function scoreByHits(batches: readonly (readonly CodegraphNode[])[]): ScoredNode[] {
   const merged = new Map<string, { node: CodegraphNode; hits: number; best: number }>()
   for (const batch of batches) {
     batch.forEach((node, position) => {
@@ -96,8 +125,20 @@ export function mergeByHits(batches: readonly (readonly CodegraphNode[])[], limi
   }
   return [...merged.values()]
     .sort((left, right) => right.hits - left.hits || left.best - right.best)
-    .slice(0, limit)
     .map(entry => ({ node: entry.node, hits: entry.hits }))
+}
+
+/**
+ * Merge per-term search results, keeping at most `limit` of the most relevant.
+ * @param batches - each term's search results, in the order the store ranked them.
+ * @param limit - largest number of declarations to return.
+ * @returns the merged declarations, most relevant first.
+ */
+export function mergeByHits(
+  batches: readonly (readonly CodegraphNode[])[],
+  limit: number,
+): ScoredNode[] {
+  return scoreByHits(batches).slice(0, limit)
 }
 
 /** Declarations that share one file, in the order the search ranked them. */

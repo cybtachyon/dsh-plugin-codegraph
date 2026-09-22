@@ -8,7 +8,7 @@ import type { CodegraphError } from '@huanlin/dsh-plugin-codegraph-service'
 import * as CodegraphSqlite from '../src/index.ts'
 import { DATABASE_RELATIVE_PATH, GraphPool, databasePath, openGraph } from '../src/database.ts'
 import { toEdge, toFile, toNode } from '../src/rows.ts'
-import { ftsPhrase, likeAnywhere } from '../src/sql.ts'
+import { ftsPhrase, likeAnywhere, memberSuffixPatterns } from '../src/sql.ts'
 import { walkImpact, walkTrace } from '../src/traverse.ts'
 import { files, impact, node, relations, search, status, trace } from '../src/queries.ts'
 import { seedProject, writeGraphAt } from './fixture.ts'
@@ -253,6 +253,41 @@ describe('query text escaping', () => {
   })
 })
 
+describe('member-delimiter patterns', () => {
+  it('splits a symbol on each member delimiter and re-joins with every convention', () => {
+    expect(memberSuffixPatterns('Group::hasPermission')).toEqual([
+      '%group::haspermission',
+      '%group.haspermission',
+      '%group#haspermission',
+    ])
+    expect(memberSuffixPatterns('MathHelper.add')).toEqual([
+      '%mathhelper::add',
+      '%mathhelper.add',
+      '%mathhelper#add',
+    ])
+  })
+
+  it('splits a doubly-qualified symbol at each occurrence', () => {
+    expect(memberSuffixPatterns('A::B::C')).toEqual([
+      '%a::b::c',
+      '%a.b::c',
+      '%a#b::c',
+      '%a::b.c',
+      '%a::b#c',
+    ])
+  })
+
+  it('escapes LIKE wildcards inside the owner and member', () => {
+    expect(memberSuffixPatterns('a%b::c')).toEqual(['%a\\%b::c', '%a\\%b.c', '%a\\%b#c'])
+  })
+
+  it('yields no patterns when the symbol carries no member delimiter', () => {
+    expect(memberSuffixPatterns('plainname')).toBeNull()
+    expect(memberSuffixPatterns('::')).toBeNull()
+    expect(memberSuffixPatterns('.leading')).toBeNull()
+  })
+})
+
 describe('graph queries', () => {
   it('ranks a declaration above a same-named import and reports alternatives', async () => {
     const root = await project(SEED)
@@ -309,6 +344,23 @@ describe('graph queries', () => {
     expect(byKind.nodes.map(entry => entry.kind)).toEqual(['import'])
     const byLanguage = search(db, { operation: 'search', ...AT(root), query: 'helper', language: 'python', limit: 10 })
     expect(byLanguage.nodes.map(entry => entry.filePath)).toEqual(['tool.py'])
+    db.close()
+  })
+
+  it('restricts search to a subtree, treating _ literally', async () => {
+    const root = await project({
+      nodes: [
+        { id: 'fn:probe-a', kind: 'function', name: 'probe', filePath: 'src/util/a.ts' },
+        { id: 'fn:probe-b', kind: 'function', name: 'probe', filePath: 'src/utXil/a.ts' },
+      ],
+    })
+    const db = openGraph(root)
+    const all = search(db, { operation: 'search', ...AT(root), query: 'probe', limit: 10 })
+    expect(all.nodes.map(entry => entry.filePath)).toEqual(['src/utXil/a.ts', 'src/util/a.ts'])
+    // The path is a directory prefix: without the escape, the pattern's `_` would also admit
+    // the src/utXil/ subtree.
+    const scoped = search(db, { operation: 'search', ...AT(root), query: 'probe', path: 'src/util', limit: 10 })
+    expect(scoped.nodes.map(entry => entry.filePath)).toEqual(['src/util/a.ts'])
     db.close()
   })
 
@@ -399,6 +451,96 @@ describe('graph queries', () => {
     expect(emptyStatus.staleFileCount).toBe(0)
     expect(emptyStatus.staleFileCountTruncated).toBe(false)
     emptyDb.close()
+  })
+})
+
+describe('member-delimiter symbol resolution', () => {
+  // One graph holding both on-disk conventions at once: v4 (the tree-sitter indexer) records
+  // `file::Class.member`, and v9 (the codegraph CLI ≥1.6) records `Namespace::Class::method`. The
+  // fallback has to let a symbol written in either delimiter resolve against a graph stored in
+  // either.
+  const SEED = {
+    nodes: [
+      { id: 'ts:method', kind: 'method', name: 'add', qualifiedName: 'src/math.ts::MathHelper.add', filePath: 'src/math.ts', startLine: 5, endLine: 6 },
+      { id: 'php:class', kind: 'class', name: 'Group', qualifiedName: 'Drupal\\group\\Entity::Group', filePath: 'src/Group.php', language: 'php', startLine: 10, endLine: 100 },
+      { id: 'php:method', kind: 'method', name: 'hasPermission', qualifiedName: 'Drupal\\group\\Entity::Group::hasPermission', filePath: 'src/Group.php', language: 'php', startLine: 40, endLine: 42 },
+      { id: 'php:sub', kind: 'method', name: 'hasPermission', qualifiedName: 'Drupal\\group\\Entity::SubGroup::hasPermission', filePath: 'src/SubGroup.php', language: 'php', startLine: 80, endLine: 82 },
+    ],
+    files: [
+      { path: 'src/math.ts', nodeCount: 1 },
+      { path: 'src/Group.php', language: 'php', nodeCount: 2 },
+      { path: 'src/SubGroup.php', language: 'php', nodeCount: 1 },
+    ],
+  }
+
+  it('resolves a symbol written with the index\'s own delimiter', async () => {
+    const root = await project(SEED)
+    const db = openGraph(root)
+    const result = node(db, { operation: 'node', ...AT(root), symbol: 'MathHelper.add', limit: 5 })
+    expect(result.node?.id).toBe('ts:method')
+    expect(result.alternatives).toEqual([])
+    db.close()
+  })
+
+  it('resolves a symbol written with a different delimiter against the same declaration', async () => {
+    const root = await project(SEED)
+    const db = openGraph(root)
+    const result = node(db, { operation: 'node', ...AT(root), symbol: 'MathHelper::add', limit: 5 })
+    expect(result.node?.id).toBe('ts:method')
+    db.close()
+  })
+
+  it('resolves a Class::member symbol against a namespace-qualified graph', async () => {
+    const root = await project(SEED)
+    const db = openGraph(root)
+    const result = node(db, { operation: 'node', ...AT(root), symbol: 'Group::hasPermission', limit: 5 })
+    // Two declarations share the Class::member suffix (SubGroup is a superstring); no exact tier
+    // fires, so the fallback's deterministic ordering decides — both methods, neither exported,
+    // and the shorter file path wins. The loser stays visible as an alternative.
+    expect(result.node?.id).toBe('php:method')
+    expect(result.alternatives.map(entry => entry.id)).toEqual(['php:sub'])
+    db.close()
+  })
+
+  it('keeps an exact qualified name ahead of the fallback', async () => {
+    const root = await project(SEED)
+    const db = openGraph(root)
+    const result = node(db, { operation: 'node', ...AT(root), symbol: 'Drupal\\group\\Entity::SubGroup::hasPermission', limit: 5 })
+    expect(result.node?.id).toBe('php:sub')
+    expect(result.alternatives).toEqual([])
+    db.close()
+  })
+
+  it('resolves the caller-facing form through callers, callees, impact, and trace', async () => {
+    const root = await project({
+      ...SEED,
+      edges: [
+        { source: 'php:class', target: 'php:method', kind: 'contains' },
+        { source: 'php:method', target: 'ts:method', kind: 'calls', line: 41 },
+      ],
+    })
+    const db = openGraph(root)
+    expect(relations(db, { operation: 'callers', ...AT(root), symbol: 'Group::hasPermission', limit: 5 }).subject?.id)
+      .toBe('php:method')
+    expect(relations(db, { operation: 'callees', ...AT(root), symbol: 'Group::hasPermission', limit: 5 })
+      .relations.map(relation => relation.node.id)).toEqual(['ts:method'])
+    expect(impact(db, { operation: 'impact', ...AT(root), symbol: 'MathHelper.add', depth: 2, limit: 5 },
+      (origin, depth) => walkImpact(db, origin, depth, 100)).subject?.id).toBe('ts:method')
+    db.close()
+  })
+
+  it('answers a Class::member name that matches nothing with a null subject', async () => {
+    const root = await project(SEED)
+    const db = openGraph(root)
+    expect(node(db, { operation: 'node', ...AT(root), symbol: 'Nobody::x', limit: 5 }).node).toBeNull()
+    db.close()
+  })
+
+  it('still resolves a simple name through the exact tiers only', async () => {
+    const root = await project(SEED)
+    const db = openGraph(root)
+    expect(node(db, { operation: 'node', ...AT(root), symbol: 'Group', limit: 5 }).node?.id).toBe('php:class')
+    db.close()
   })
 })
 

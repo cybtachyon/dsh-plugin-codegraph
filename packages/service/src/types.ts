@@ -161,6 +161,12 @@ export interface CodegraphSearchRequest extends CodegraphRequestBase {
   readonly kind?: string
   /** Restrict results to this language when set. See `LANGUAGES`. */
   readonly language?: string
+  /**
+   * Restrict results to declarations in files under this project-relative directory when set, so a
+   * caller that knows roughly where a symbol lives is not answered from a same-named declaration
+   * somewhere else in a large tree.
+   */
+  readonly path?: string
   /** Largest number of nodes to return; the store reports whether it truncated. */
   readonly limit: number
 }

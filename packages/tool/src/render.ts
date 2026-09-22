@@ -37,19 +37,51 @@ function codeBlock(path: string, code: string | null, startLine: number | undefi
 }
 
 /**
+ * The retry guidance an empty answer appends after naming what was asked. An empty answer that
+ * says nothing about HOW to retry is what sends a model into a loop of guessing symbols and
+ * failing again, so every empty message ends with the next call to make: the index stores
+ * declarations, and `search` is the fuzzy path that finds the exact names to feed back.
+ * @param subject - the text the model asked for, when the operation takes one.
+ * @returns the guidance sentence, or `''` when the operation carries no subject to name.
+ */
+function noMatchGuidance(operation: CodegraphToolValue['operation'], subject: string | undefined): string {
+  if (subject === undefined) return ''
+  const quoted = ` "${subject}"`
+  switch (operation) {
+    case 'search':
+      return ` The index stores declarations only — names in comments or strings do not appear. Try a different or shorter identifier, or the grep tool for a literal text match.`
+    case 'explore':
+      return ` Each word is searched on its own, so none of the words matched a declaration. Try a different identifier, or the grep tool for a literal text match.`
+    case 'node':
+      return ` node resolves a simple name, or a member written as Class::member or in the index's own convention. Run search${quoted} to list the closest names, then pass one of them to node.`
+    case 'callers':
+    case 'callees':
+    case 'impact':
+      return ` Run search${quoted} to find the closest name, then retry.`
+    case 'trace':
+      return ` At least one endpoint is not an indexed name. Run search for each endpoint to find the closest names, then retry.`
+    default:
+      return ''
+  }
+}
+
+/**
  * Render one result as the text the model reads.
  * @param value - the canonical value the operation returned.
+ * @param subject - the text the model asked for (query, symbol, or endpoints), so an empty answer
+ * can name it and point at the retry that resolves it; the tool's render callback supplies it.
  * @returns the rendered text.
  */
-export function renderCodegraph(value: CodegraphToolValue): string {
+export function renderCodegraph(value: CodegraphToolValue, subject?: string): string {
+  const empty = () => `No declaration matches${subject === undefined ? '' : ` "${subject}"`} in ${value.project_path}.${noMatchGuidance(value.operation, subject)}`
   switch (value.operation) {
     case 'search': {
-      if (value.symbols.length === 0) return `No declaration matches in ${value.project_path}.`
+      if (value.symbols.length === 0) return empty()
       const header = `Declarations${counted(value.symbols.length, value.total, value.truncated)}:`
       return [header, ...value.symbols.map(symbol => symbolLine(symbol))].join('\n')
     }
     case 'node': {
-      if (value.symbol === null) return `No declaration matches in ${value.project_path}.`
+      if (value.symbol === null) return empty()
       const lines = [symbolLine(value.symbol)]
       if (value.symbol.docstring !== undefined) lines.push(`  ${value.symbol.docstring.replaceAll('\n', '\n  ')}`)
       if (value.alternatives.length > 0) {
@@ -69,7 +101,7 @@ export function renderCodegraph(value: CodegraphToolValue): string {
     }
     case 'callers':
     case 'callees': {
-      if (value.symbol === null) return `No declaration matches in ${value.project_path}.`
+      if (value.symbol === null) return empty()
       const direction = value.operation === 'callers' ? 'Callers of' : 'Called by'
       if (value.relations.length === 0) return `${direction} ${symbolLine(value.symbol)}: none in the index.`
       const header = `${direction} ${value.symbol.name}${counted(value.relations.length, value.total, value.truncated)}:`
@@ -83,7 +115,7 @@ export function renderCodegraph(value: CodegraphToolValue): string {
       ].join('\n')
     }
     case 'impact': {
-      if (value.symbol === null) return `No declaration matches in ${value.project_path}.`
+      if (value.symbol === null) return empty()
       if (value.affected.length === 0) return `Nothing in the index depends on ${value.symbol.name}.`
       const header = `Changing ${value.symbol.name} can affect${counted(value.affected.length, value.total, value.truncated)}:`
       return [
@@ -92,7 +124,7 @@ export function renderCodegraph(value: CodegraphToolValue): string {
       ].join('\n')
     }
     case 'trace': {
-      if (value.from === null || value.to === null) return `No declaration matches in ${value.project_path}.`
+      if (value.from === null || value.to === null) return empty()
       if (value.paths.length === 0) {
         return `No call path from ${value.from.name} to ${value.to.name} within the searched depth. The flow may cross a dynamic dispatch the index cannot follow.`
       }
@@ -139,7 +171,7 @@ export function renderCodegraph(value: CodegraphToolValue): string {
       return lines.join('\n')
     }
     case 'explore': {
-      if (value.files.length === 0) return `No declaration matches in ${value.project_path}.`
+      if (value.files.length === 0) return empty()
       const lines = [`Source for ${value.files.length} file${value.files.length === 1 ? '' : 's'}${value.truncated ? ` (of ${value.total} matched)` : ''}:`]
       for (const file of value.files) {
         lines.push(...file.symbols.map(symbol => symbolLine(symbol)))

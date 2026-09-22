@@ -67,14 +67,21 @@ END`
 
 /**
  * How exactly a candidate matched the requested symbol: a fully qualified name beats a
- * case-sensitive simple name, which beats a case-insensitive one. Binds the symbol three times.
+ * case-sensitive simple name, which beats a case-insensitive one, which beats a member-suffix
+ * fallback (`Class::method` written in one separator convention matching an index that stored the
+ * other). Binds the symbol three times and, when the fallback is active, one parameter per
+ * fallback pattern, ahead of the other order-by parameters.
  */
-const SYMBOL_TIER_CASE = `CASE
+function symbolTierCase(patterns: readonly string[]): string {
+  const memberCase = patterns.length === 0
+    ? '  ELSE 3\n'
+    : `  WHEN ${patterns.map(() => "lower(n.qualified_name) LIKE ? ESCAPE '\\'").join('\n    OR ')} THEN 3\n  ELSE 4\n`
+  return `CASE
   WHEN n.qualified_name = ? THEN 0
   WHEN n.name = ? THEN 1
   WHEN lower(n.name) = lower(?) THEN 2
-  ELSE 3
-END`
+${memberCase}END`
+}
 
 /**
  * How a candidate matched a free-text search: an exact name beats a case-insensitive one, which
@@ -92,9 +99,17 @@ END`
 /**
  * Order candidates for a symbol lookup: match exactness first, then declaration relevance, then
  * exported over internal, then file and line so equally ranked results never reorder between runs.
- * Binds the symbol three times, ahead of any other parameter in the statement.
+ * Binds the symbol three times and, when the member-suffix fallback is active, one parameter per
+ * fallback pattern, ahead of any other parameter in the statement.
+ * @param patterns - the fallback patterns the matching `WHERE` carries; pass none for an exact-only lookup.
+ * @returns the `ORDER BY` expression.
  */
-export const SYMBOL_ORDER = `${SYMBOL_TIER_CASE}, ${KIND_RANK_CASE}, n.is_exported DESC, n.file_path, n.start_line`
+export function symbolOrder(patterns: readonly string[] = []): string {
+  return `${symbolTierCase(patterns)}, ${KIND_RANK_CASE}, n.is_exported DESC, n.file_path, n.start_line`
+}
+
+/** The exact-only order, for a symbol lookup that carries no member-suffix fallback. */
+export const SYMBOL_ORDER = symbolOrder()
 
 /** Order candidates for a free-text search. Binds the query four times. */
 export const SEARCH_ORDER = `${SEARCH_TIER_CASE}, ${KIND_RANK_CASE}, n.is_exported DESC, n.file_path, n.start_line`
@@ -112,12 +127,67 @@ export function ftsPhrase(query: string): string {
 }
 
 /**
+ * Escape the `LIKE` wildcard characters in a string so they match literally.
+ * @param text - the raw text, already in whatever case the caller wants.
+ * @returns the escaped text, for use inside a `LIKE ? ESCAPE '\\'` pattern.
+ */
+export function escapeLike(text: string): string {
+  return text.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')
+}
+
+/**
  * Wrap a raw string as a SQL `LIKE` pattern matching it anywhere, escaping the wildcard characters
  * so a symbol containing `%` or `_` matches literally.
  * @param query - the raw search text.
  * @returns the escaped pattern, for use with `LIKE ? ESCAPE '\\'`.
  */
 export function likeAnywhere(query: string): string {
-  const escaped = query.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')
-  return `%${escaped.toLowerCase()}%`
+  return `%${escapeLike(query.toLowerCase())}%`
+}
+
+/**
+ * The member separators the on-disk formats place between a container and its member: `::` (PHP's
+ * `Namespace::Class::method`, and the `file::Class` prefix every format uses), `.` (TypeScript's
+ * `file::Class.member`), and `#` (the Ruby and Java-style convention models reach for). A symbol
+ * written with any one of them must resolve against an index that stored any other.
+ */
+export const MEMBER_SEPARATORS = ['::', '.', '#'] as const
+
+/**
+ * Largest number of separator occurrences one symbol may contribute fallback patterns for, so a
+ * pathological string cannot grow an unbounded `OR` clause.
+ */
+const MAX_MEMBER_PATTERNS = 8
+
+/**
+ * The fallback patterns that let a symbol written with one member-separator convention match an
+ * index that stored the same declaration with another.
+ *
+ * The symbol is split at EVERY occurrence of ANY of the three separators, and each `(owner, member)`
+ * pair is re-joined with EVERY separator the formats use: `Codegraph::registerStore` thus matches
+ * an index recording `src/util.ts::Codegraph.registerStore`, and `Group::hasPermission` matches
+ * `Drupal\group\Entity::Group::hasPermission`. The patterns are `lower()`ed suffixes, so a class
+ * whose name is a superstring of the requested one (`SubGroup`) can match — the exact tiers win
+ * first, and the `node` answer's `alternatives` list lets the caller see the ambiguity.
+ * @param symbol - the raw symbol as the model wrote it.
+ * @returns the distinct escaped lowercase patterns, or `null` when the symbol carries no member
+ * separator and no fallback applies.
+ */
+export function memberSuffixPatterns(symbol: string): string[] | null {
+  const lower = symbol.toLowerCase()
+  const patterns = new Set<string>()
+  let occurrences = 0
+  for (let i = 0; i < lower.length; i++) {
+    const separator = MEMBER_SEPARATORS.find(candidate => lower.startsWith(candidate, i))
+    if (separator === undefined) continue
+    if (occurrences >= MAX_MEMBER_PATTERNS) break
+    occurrences += 1
+    const owner = lower.slice(0, i)
+    const member = lower.slice(i + separator.length)
+    if (owner === '' || member === '') continue
+    for (const joiner of MEMBER_SEPARATORS) {
+      patterns.add(`%${escapeLike(owner)}${joiner}${escapeLike(member)}`)
+    }
+  }
+  return patterns.size === 0 ? null : [...patterns]
 }

@@ -14,7 +14,7 @@ import Codegraph, { CodegraphIndexerId, CodegraphNodeId, CodegraphStoreId } from
 import type { CodegraphIndexReport, CodegraphNode, CodegraphRequest, CodegraphStoreProvider } from '@huanlin/dsh-plugin-codegraph-service'
 import * as ToolCodegraph from '../src/index.ts'
 import { callTitle, projectRoot } from '../src/index.ts'
-import { declarationsOnly, groupByFile, mergeByHits, mergeRelations, taskTerms } from '../src/compose.ts'
+import { declarationsOnly, groupByFile, mergeByHits, mergeRelations, queryTerms, scoreByHits, taskTerms } from '../src/compose.ts'
 import { toAffected, toHop, toRelation, toSymbol } from '../src/projection.ts'
 import { renderCodegraph } from '../src/render.ts'
 import type { CodegraphToolValue } from '../src/schema.ts'
@@ -451,6 +451,20 @@ describe('the tool plugin', () => {
       indexes: () => Promise.resolve(true),
       query: ((request: CodegraphRequest) => {
         seen.push(request)
+        if (request.operation === 'search') {
+          // The stub echoes the queried term into a node of its own, plus a 'shared' declaration
+          // every term also finds: a test searching several words can then see which sub-queries
+          // ran, and a declaration both words find must merge ahead of the single-word ones.
+          return Promise.resolve({
+            kind: 'search',
+            nodes: [
+              graphNode({ id: `fn:${request.query}`, name: request.query, qualifiedName: request.query }),
+              graphNode({ id: 'fn:shared', name: 'shared', qualifiedName: 'shared', filePath: 'shared.ts' }),
+            ],
+            total: 2,
+            truncated: false,
+          })
+        }
         return Promise.resolve(answers[request.operation])
       }) as CodegraphStoreProvider['query'],
     }
@@ -610,6 +624,60 @@ describe('the tool plugin', () => {
     expect(seen.find(request => request.operation === 'impact')?.depth).toBe(3)
   })
 
+  it('searches each word of a multi-word query and merges the answers by hits', async () => {
+    const root = await workspace()
+    const ctx = await mount(root)
+    const owner = agent(ctx, root)
+    const result = await call(ctx, owner, { operation: 'search', query: 'alpha beta' })
+    expect(result.isError).toBe(false)
+    // One sub-query per word, each word intact — the old code sent the whole string as one
+    // substring, which is what "EmptyOperationProvider EmptyPermissionProvider" never matched.
+    expect(seen.filter(request => request.operation === 'search').map(request => request.query))
+      .toEqual(['alpha', 'beta'])
+    const text = result.content.map(block => block.type === 'text' ? block.text : '').join('')
+    // 'shared' is found by both sub-queries, so it leads; the single-word declarations follow in
+    // the order their searches returned them.
+    expect(text.indexOf('shared')).toBeLessThan(text.indexOf('alpha'))
+    expect(text.indexOf('alpha')).toBeLessThan(text.indexOf('beta'))
+  })
+
+  it('passes kind, language, and path to every sub-query of a multi-word search', async () => {
+    const root = await workspace()
+    const ctx = await mount(root)
+    const owner = agent(ctx, root)
+    await call(ctx, owner, { operation: 'search', query: 'alpha beta', path: 'web/modules', kind: 'function', language: 'php' })
+    const subQueries = seen.filter(request => request.operation === 'search')
+    expect(subQueries).toHaveLength(2)
+    for (const request of subQueries) {
+      expect(request).toMatchObject({ path: 'web/modules', kind: 'function', language: 'php' })
+    }
+  })
+
+  it('keeps a single-word search on its one-store-call shape', async () => {
+    const root = await workspace()
+    const ctx = await mount(root)
+    const owner = agent(ctx, root)
+    await call(ctx, owner, { operation: 'search', query: 'alpha' })
+    expect(seen.filter(request => request.operation === 'search')).toHaveLength(1)
+    expect(seen.filter(request => request.operation === 'search')[0]).toMatchObject({ query: 'alpha' })
+  })
+
+  it('explore treats a multi-word query as a list of identifiers', async () => {
+    // The stub's echoed nodes keep the default app.ts location, so both identifiers land in one
+    // file group; the shared node the stub adds for every term lands in its own.
+    const root = await workspace({ 'app.ts': 'function alpha() {}\nfunction beta() {}\n' })
+    const ctx = await mount(root)
+    const owner = agent(ctx, root)
+    const result = await call(ctx, owner, { operation: 'explore', query: 'alpha beta' })
+    expect(result.isError).toBe(false)
+    expect(seen.filter(request => request.operation === 'search').map(request => request.query)).toEqual(['alpha', 'beta'])
+    const text = result.content.map(block => block.type === 'text' ? block.text : '').join('')
+    expect(text).toContain('function alpha() {}')
+    expect(text).toContain('function beta() {}')
+  })
+
+
+
   it.each([
     ['node', { operation: 'node' }, /requires a non-empty "symbol"/],
     ['search', { operation: 'search' }, /requires a non-empty "query"/],
@@ -716,6 +784,46 @@ describe('status against a root no store claims', () => {
 describe('remaining display and parsing paths', () => {
   it('counts a repeated task word once, keeping its first spelling', () => {
     expect(taskTerms('Cache cache caching', 5)).toEqual(['caching', 'Cache'])
+  })
+
+  it('splits an explicit query on whitespace and separators, keeping every word', () => {
+    // A query is a deliberate list of identifiers: unlike taskTerms, short and common words
+    // survive, so a model that asked for one gets one searched.
+    expect(queryTerms('add fix', 5)).toEqual(['add', 'fix'])
+    expect(queryTerms('A, B;  C', 5)).toEqual(['A', 'B', 'C'])
+  })
+
+  it('splits a member-written query into its parts, like the CLI', () => {
+    // "Class::member" (or Class.member) is the model's notation; searching it as one opaque
+    // string finds nothing, so it is searched as its parts — the same way the codegraph CLI's
+    // query treats delimiters.
+    expect(queryTerms('Group::hasPermission', 5)).toEqual(['Group', 'hasPermission'])
+    expect(queryTerms('Group.hasPermission', 5)).toEqual(['Group', 'hasPermission'])
+    expect(queryTerms('Group#hasPermission', 5)).toEqual(['Group', 'hasPermission'])
+    // A mixed query splits on both whitespace and delimiters.
+    expect(queryTerms('GroupType hasPlugin Group::id', 5)).toEqual(['GroupType', 'hasPlugin', 'Group', 'id'])
+  })
+
+  it('keeps a single delimited word a single query when it carries no delimiter', () => {
+    expect(queryTerms('parse', 5)).toEqual(['parse'])
+  })
+
+  it('drops a repeated query word in another casing, keeping the first spelling', () => {
+    expect(queryTerms('GroupType grouptype GROUPTYPE', 5)).toEqual(['GroupType'])
+  })
+
+  it('caps an over-long query at the budget, in written order', () => {
+    expect(queryTerms('a b c d e', 2)).toEqual(['a', 'b'])
+  })
+
+  it('scores a declaration found by several words ahead of single-word ones', () => {
+    const both = graphNode({ id: 'fn:both', name: 'both', qualifiedName: 'both' })
+    const first = graphNode({ id: 'fn:first', name: 'first', qualifiedName: 'first' })
+    const second = graphNode({ id: 'fn:second', name: 'second', qualifiedName: 'second' })
+    const scored = scoreByHits([[both, first], [both, second]])
+    expect(scored.map(entry => entry.node.name)).toEqual(['both', 'first', 'second'])
+    expect(scored[0]!.hits).toBe(2)
+    expect(mergeByHits([[both, first], [both, second]], 2).map(entry => entry.node.name)).toEqual(['both', 'first'])
   })
 
   it('renders a traced hop whose edge site the indexer never recorded', () => {
@@ -826,6 +934,51 @@ describe('answers a store returns when nothing resolves', () => {
     expect(result.isError).toBe(false)
     expect(result.content.map(block => block.type === 'text' ? block.text : '').join(''))
       .toContain('source unavailable for gone.ts')
+  })
+
+  it('points an empty search at the retry that finds the name', async () => {
+    const root = await workspace()
+    const ctx = new Context()
+    context = ctx
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(LocalFileSystem, { cwd: root })
+    await ctx.plugin(Codegraph)
+    ctx.codegraph.registerStore({
+      id: CodegraphStoreId('no-search'),
+      indexes: () => Promise.resolve(true),
+      query: (() =>
+        Promise.resolve({ kind: 'search', nodes: [], total: 0, truncated: false })) as CodegraphStoreProvider['query'],
+    })
+    await ctx.plugin(ToolCodegraph)
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('empty-search-guidance'),
+      name: 'codegraph',
+      arguments: { operation: 'search', query: 'EmptyOperationProvider' },
+      agent: owner(ctx, root),
+    })
+    expect(result.isError).toBe(false)
+    const text = result.content.map(block => block.type === 'text' ? block.text : '').join('')
+    expect(text).toMatch(/No declaration matches "EmptyOperationProvider" in .*\./)
+    expect(text).toContain('The index stores declarations only')
+  })
+
+  it('points an unresolved Class::member node at the search retry', async () => {
+    const root = await workspace()
+    const ctx = await mountEmpty(root)
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('empty-member-node'),
+      name: 'codegraph',
+      arguments: { operation: 'node', symbol: 'Group::hasPermission' },
+      agent: owner(ctx, root),
+    })
+    expect(result.isError).toBe(false)
+    const text = result.content.map(block => block.type === 'text' ? block.text : '').join('')
+    expect(text).toMatch(/No declaration matches "Group::hasPermission" in .*\./)
+    expect(text).toContain('Run search "Group::hasPermission" to list the closest names')
   })
 })
 

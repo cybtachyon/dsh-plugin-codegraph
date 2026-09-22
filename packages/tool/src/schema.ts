@@ -236,15 +236,17 @@ export const CODEGRAPH_PARAMETERS = {
     required: true,
     enum: [...QUERY_OPERATIONS],
     description:
-      'search (find declarations by name), node (one symbol with its callers and callees), callers, callees, impact (what a change reaches), trace (call path from one symbol to another), files (indexed file list), status (index size and freshness), explore (several related symbols with their source), context (everything relevant to a task). To build or refresh the index itself, call the codegraph_index tool instead.',
+      'search (find declarations by one or more names or words, space-separated; each word is searched and the results merged), node (one symbol with its callers and callees: a simple name, a Class::member form like Group::hasPermission, or the full qualified name a search returns), callers (what calls a symbol), callees (what a symbol calls), impact (what a change reaches), trace (call path from one symbol to another), files (indexed file list), status (index size and freshness), explore (the source of one or more identifiers, space-separated, grouped by file), context (everything relevant to a prose task). To build or refresh the index itself, call the codegraph_index tool instead.',
   },
   symbol: {
     type: 'string',
-    description: 'The symbol name for node, callers, callees, and impact. Simple or qualified.',
+    description:
+      'The symbol for node, callers, callees, impact, and trace: a simple name (parse), a member written Class::member (Group::hasPermission), or the full qualified name a search returns. All three resolve; the answer shows the exact name it matched so a guess that was close still lands.',
   },
   query: {
     type: 'string',
-    description: 'The search text for search and explore. Matches names, qualified names, signatures, and documentation.',
+    description:
+      'For search and explore: one or more identifiers or words, space-separated. Each word is searched on its own and the results merged, so "GroupType hasPlugin" finds both; a member written Class::member or Class.member is split into its parts and each part searched, so "Group.hasPermission" finds the class and the method. A single word without delimiters behaves as one exact search.',
   },
   task: {
     type: 'string',
@@ -252,7 +254,10 @@ export const CODEGRAPH_PARAMETERS = {
   },
   from: { type: 'string', description: 'The symbol a traced flow starts at. Required by trace.' },
   to: { type: 'string', description: 'The symbol a traced flow should reach. Required by trace.' },
-  path: { type: 'string', description: 'Restrict files to this directory, relative to the project root.' },
+  path: {
+    type: 'string',
+    description: 'Restrict results to this directory, relative to the project root. Applies to search and files.',
+  },
   pattern: { type: 'string', description: 'Restrict files to paths matching this glob, e.g. src/pages/*.tsx.' },
   kind: { type: 'string', description: 'Restrict search to one declaration kind, e.g. function, class, interface.' },
   language: { type: 'string', description: 'Restrict search to one language, e.g. typescript, python, go.' },

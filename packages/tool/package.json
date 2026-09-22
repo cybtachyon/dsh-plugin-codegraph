@@ -1,6 +1,6 @@
 {
   "name": "@huanlin/dsh-plugin-codegraph-tool",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Model-facing codegraph tools for DeepSeek Harness — a read-only codegraph tool with ten structural query operations, a codegraph_index tool on its own timeout budget, and an advisory reminder that points bash code-reading at codegraph",
   "keywords": [
     "dsh",

@@ -31,7 +31,7 @@ import type {} from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
-import { declarationsOnly, groupByFile, mergeByHits, mergeRelations, taskTerms } from './compose.ts'
+import { declarationsOnly, groupByFile, mergeByHits, mergeRelations, queryTerms, scoreByHits, taskTerms } from './compose.ts'
 import type { FileGroup } from './compose.ts'
 import { toAffected, toHop, toRelation, toSymbol } from './projection.ts'
 import type { ProjectionLimits, SymbolView } from './projection.ts'
@@ -53,7 +53,7 @@ export {
   type CodegraphToolValue,
   type CodegraphValueFor,
 } from './schema.ts'
-export { declarationsOnly, groupByFile, mergeByHits, mergeRelations, taskTerms } from './compose.ts'
+export { declarationsOnly, groupByFile, mergeByHits, mergeRelations, queryTerms, scoreByHits, taskTerms } from './compose.ts'
 export {
   bashCommand,
   commandSegments,
@@ -88,7 +88,7 @@ export const DEFAULT_CODEGRAPH_INDEX_TIMEOUT_MS = 300_000
  * `codegraph_index` as the no-index procedure and the grep tool as the literal-text fallback.
  */
 export const CODEGRAPH_PROMPT_TEXT =
-  'Use the codegraph tool — not bash — to answer questions about the structure of existing code. Before running a bash command that reads, searches, or locates code (sed, cat, head, tail, grep, find, rg), call codegraph first: `codegraph node <symbol>` returns one symbol\'s declaration with its code and call relations, without needing the file\'s path; `search <name>` finds declarations by name; `explore <query>` and `context <task>` give a task-sized overview with source. It matches real declarations, never occurrences in comments or strings, and returns far less text than an unbounded sed or grep. Never assume a symbol\'s properties, method signatures, or existence — the index is the source of truth; a missing result means the symbol is not indexed, so fall back to the grep tool for literal text before concluding it does not exist. bash is for running things — builds, tests, commands — and the read tool is for when you need a whole file. If codegraph reports no index for a root that is a container directory holding the project (a home or workspace directory), pass the project\'s own root as project_path and retry; if the project root itself has no index, call codegraph_index to build one and then retry. Results reflect the last time the workspace was indexed.'
+  'Use the codegraph tool — not bash — to answer questions about the structure of existing code. Before running a bash command that reads, searches, or locates code (sed, cat, head, tail, grep, find, rg), call codegraph first: `codegraph node <symbol>` returns one symbol\'s declaration with its code and call relations, without needing the file\'s path; `search <name>` finds declarations by name; `explore <query>` and `context <task>` give a task-sized overview with source. Write a symbol as the model writes it: a simple name (parse), a member as Class::member (Group::hasPermission), or the full qualified name a search returns — all three resolve. Name several identifiers space-separated in one search or explore call ("GroupType hasPlugin" finds both); a member written Class::member is searched as its parts. It matches real declarations, never occurrences in comments or strings, and returns far less text than an unbounded sed or grep. Never assume a symbol\'s properties, method signatures, or existence — the index is the source of truth; a missing result means the symbol is not indexed, so fall back to the grep tool for literal text before concluding it does not exist. bash is for running things — builds, tests, commands — and the read tool is for when you need a whole file. If codegraph reports no index for a root that is a container directory holding the project (a home or workspace directory), pass the project\'s own root as project_path and retry; if the project root itself has no index, call codegraph_index to build one and then retry. Results reflect the last time the workspace was indexed.'
 
 /** Plugin configuration: the defaults and caps the seam requires the consumer to own. */
 export interface Config {
@@ -195,6 +195,60 @@ function bounded(value: number | undefined, fallback: number, max: number): numb
 }
 
 /**
+ * Largest number of sub-queries one multi-term call may issue. A query naming more identifiers than
+ * this still gets an answer — the first eight words, in the order written — but the extra words
+ * would only spend store round-trips on a tail the result limit would drop anyway.
+ */
+const MAX_QUERY_TERMS = 8
+
+/**
+ * Search a query the way the model means it: each whitespace- or comma-separated word is searched
+ * on its own against the store, and the per-word answers merge into one ranked list, a declaration
+ * found by several words ahead of one found by a single word.
+ *
+ * A single-word query short-circuits to the store's own answer untouched, so the one-word call shape
+ * is byte-identical to the one it used to take; only multi-word queries gain the merge, which is what
+ * lets `search "A B"` and `explore "A B"` name several symbols in one call instead of reading the
+ * whole string as one substring.
+ * @param ctx - the plugin context.
+ * @param root - the project root the sub-queries run against.
+ * @param query - the raw query text.
+ * @param filters - the optional kind/language/path restrictions, passed to every sub-query.
+ * @param limit - largest number of declarations the answer carries, per sub-query and after merging.
+ * @param signal - aborts the sub-queries.
+ * @returns the merged declarations with the total and truncation the answer should report.
+ */
+async function searchTerms(
+  ctx: Context,
+  root: string,
+  query: string,
+  filters: { kind?: string; language?: string; path?: string },
+  limit: number,
+  signal: AbortSignal | undefined,
+): Promise<{ nodes: readonly CodegraphNode[]; total: number; truncated: boolean }> {
+  const terms = queryTerms(query, MAX_QUERY_TERMS)
+  const batches = await Promise.all(terms.map(term => ctx.codegraph.query({
+    operation: 'search',
+    projectRoot: root,
+    query: term,
+    ...filters,
+    limit,
+  }, signal)))
+  if (terms.length === 1) {
+    // terms.length === 1 proved the batch holds exactly one entry; the assertion only satisfies
+    // noUncheckedIndexedAccess, no branch is implied.
+    const only = batches[0]!
+    return { nodes: only.nodes, total: only.total, truncated: only.truncated }
+  }
+  const scored = scoreByHits(batches.map(batch => batch.nodes))
+  return {
+    nodes: scored.slice(0, limit).map(entry => entry.node),
+    total: scored.length,
+    truncated: batches.some(batch => batch.truncated) || scored.length > limit,
+  }
+}
+
+/**
  * Register the `codegraph` tool and its system-prompt guidance.
  * @param ctx - the plugin context (must inject `tools`, `codegraph`, `fs`, `systemPrompt`).
  * @param config - the resolved plugin configuration.
@@ -219,11 +273,11 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'codegraph',
     description:
-      'First source for questions about code structure: call this before running bash (sed, cat, head, tail, grep, find) to read, search, or locate code, before writing a script to introspect code, and before writing code that depends on existing symbols, and prefer it over grep. Query a pre-built index of the workspace\'s declarations and their relationships: where a symbol is declared (its code with include_code), what calls it, what it calls, what a change to it can affect, and how one symbol reaches another. It matches declarations, not occurrences in comments or strings, and finds files whose path you do not know. If it reports no index for a root that contains the project as a subdirectory, pass the project\'s own root as project_path; if the project root itself has no index, call codegraph_index to build one, then retry; use grep only as the fallback for literal text. Answers reflect the last time the workspace was indexed.',
+      'First source for questions about code structure: call this before running bash (sed, cat, head, tail, grep, find) to read, search, or locate code, before writing a script to introspect code, and before writing code that depends on existing symbols, and prefer it over grep. Query a pre-built index of the workspace\'s declarations and their relationships: where a symbol is declared (its code with include_code), what calls it, what it calls, what a change to it can affect, and how one symbol reaches another. It matches declarations, not occurrences in comments or strings, and finds files whose path you do not know. search and explore take one or more identifiers in a single call, space-separated ("GroupType hasPlugin" finds both, merged), and a member written Class::member or Class.member is searched as its parts; node and its friends take one symbol — a simple name, Class::member (Group::hasPermission), or the full qualified name a search returns. If it reports no index for a root that contains the project as a subdirectory, pass the project\'s own root as project_path; if the project root itself has no index, call codegraph_index to build one, then retry; use grep only as the fallback for literal text. Answers reflect the last time the workspace was indexed.',
     parameters: CODEGRAPH_PARAMETERS,
     output: {
       schema: CODEGRAPH_OUTPUT_SCHEMA,
-      render: (_args, value) => [{ type: 'text', text: renderCodegraph(value) }],
+      render: (args, value) => [{ type: 'text', text: renderCodegraph(value, renderSubject(args)) }],
     },
     timeoutMs: resolved.timeoutMs,
     async execute(args, exec) {
@@ -370,6 +424,30 @@ export function callTitle(args: CodegraphToolArgs): string {
 }
 
 /**
+ * The text the model asked for, for the operations whose empty answers can say what was asked:
+ * the renderer uses it to turn "no match" into a retry that names the words the model should vary.
+ * @param args - the validated tool arguments.
+ * @returns the query, symbol, or endpoint text of the call, or `undefined` for operations that
+ * take no subject.
+ */
+function renderSubject(args: CodegraphToolArgs): string | undefined {
+  switch (args.operation) {
+    case 'search':
+    case 'explore':
+      return args.query
+    case 'node':
+    case 'callers':
+    case 'callees':
+    case 'impact':
+      return args.symbol
+    case 'trace':
+      return args.from === undefined ? undefined : `${args.from} → ${args.to ?? '?'}`
+    default:
+      return undefined
+  }
+}
+
+/**
  * Build or refresh the on-disk index for one project. The dedicated tool this backs carries its own,
  * much larger timeout budget than a query — indexing a monorepo is a different order of work.
  * @param ctx - the plugin context.
@@ -423,20 +501,17 @@ async function run(
 
   switch (args.operation) {
     case 'search': {
-      const result = await ctx.codegraph.query({
-        operation: 'search',
-        projectRoot: root,
-        query: required(args, 'query'),
+      const found = await searchTerms(ctx, root, required(args, 'query'), {
         ...args.kind === undefined ? {} : { kind: args.kind },
         ...args.language === undefined ? {} : { language: args.language },
-        limit,
-      }, signal)
+        ...args.path === undefined ? {} : { path: args.path },
+      }, limit, signal)
       return {
         operation: 'search',
         project_path: root,
-        symbols: result.nodes.map(node => toSymbol(node, projection)),
-        total: result.total,
-        truncated: result.truncated,
+        symbols: found.nodes.map(node => toSymbol(node, projection)),
+        total: found.total,
+        truncated: found.truncated,
       }
     }
     case 'node': {
@@ -556,20 +631,19 @@ async function run(
       }
     }
     case 'explore': {
-      const result = await ctx.codegraph.query({
-        operation: 'search',
-        projectRoot: root,
-        query: required(args, 'query'),
-        limit,
-      }, signal)
-      const declarations = declarationsOnly(result.nodes)
+      // The CLI's explore takes a list of identifiers, not a phrase: each word is a symbol the
+      // caller wants source for, so the words are searched individually and merged — a single
+      // substring match across the whole string finds nothing when the words name separate
+      // declarations, which is the shape of every multi-identifier query.
+      const found = await searchTerms(ctx, root, required(args, 'query'), {}, limit, signal)
+      const declarations = declarationsOnly(found.nodes)
       const groups = groupByFile(declarations, config.maxSourceFiles)
       return {
         operation: 'explore',
         project_path: root,
         files: await Promise.all(groups.map(group => explored(ctx, root, group, projection, source, signal))),
-        total: result.total,
-        truncated: result.truncated || groups.length < countFiles(declarations),
+        total: found.total,
+        truncated: found.truncated || groups.length < countFiles(declarations),
       }
     }
     case 'context': {

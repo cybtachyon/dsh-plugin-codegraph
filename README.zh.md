@@ -45,6 +45,8 @@ codegraph查一次就能全部答上来。本插件把两半都带齐了:一半�
 | `explore` | 一组相关的定义,连源码一起给 | `query` |
 | `context` | 跟某个任务有关的所有东西 | `task` |
 
+`search` 和 `explore` 的 query 解析方式与 CLI 的 `query` 一致:空格、逗号、分号分隔的一组标识符,逐个检索、结果合并,所以 `GroupType hasPlugin` 两个都能找到;写成 `Class::member` 或 `Class.member` 的成员会拆成各部分分别检索,`Group.hasPermission` 就能同时找到类和方法。`node` 等接受一个符号:简单名、`Class::member` 形式的成员、或 `search` 返回的完整限定名,三者都能对上——不管磁盘上记的是本插件的 `file::Class.member` 还是 CLI 的 `Namespace::Class::method`。索引里查不到的声明会明确报"未找到",并给出列出最接近名字的 `search` 调用。
+
 ### `codegraph_index` —— 建索引或重建
 
 它没有做成第十一个操作,而是单独一个工具,原因很实际:建索引可能要几分钟,查询是毫秒级,而一个工具的超时预算在注册时就写死了。合在一起就只能二选一——预算给小了,大仓库建到一半被掐;给大了,查询卡死也发现不了。

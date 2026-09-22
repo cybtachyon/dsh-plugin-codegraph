@@ -36,9 +36,11 @@ import type { NodeRow } from './rows.ts'
 import {
   NODE_COLUMNS,
   SEARCH_ORDER,
-  SYMBOL_ORDER,
+  escapeLike,
   ftsPhrase,
   likeAnywhere,
+  memberSuffixPatterns,
+  symbolOrder,
 } from './sql.ts'
 
 /** Run a statement and return its rows already typed as raw records. */
@@ -57,20 +59,29 @@ function scalar(db: DatabaseSync, sql: string, ...params: unknown[]): number {
 
 /**
  * Candidate declarations for a symbol name, most relevant first.
+ *
+ * The exact tiers (qualified name, name, case-insensitive name) come first; when the symbol carries
+ * a member separator (`Class::method`, `Class.member`, …) a fallback tier additionally matches the
+ * index's qualified-name suffixes, so a symbol written with one separator convention resolves
+ * against an index that stored it with another.
  * @param db - the open graph connection.
  * @param symbol - the simple or qualified name to resolve.
  * @param limit - largest number of candidates to read.
  * @returns the matching nodes in relevance order; empty when the name matches nothing.
  */
 function resolveSymbol(db: DatabaseSync, symbol: string, limit: number): CodegraphNode[] {
+  const patterns = memberSuffixPatterns(symbol)
+  const memberWhere = patterns === null ? '' : ` OR ${patterns.map(() => "lower(n.qualified_name) LIKE ? ESCAPE '\\'").join(' OR ')}`
   return rows(
     db,
     `SELECT ${NODE_COLUMNS} FROM nodes n
-      WHERE n.qualified_name = ? OR n.name = ? OR lower(n.name) = lower(?)
-      ORDER BY ${SYMBOL_ORDER}
+      WHERE n.qualified_name = ? OR n.name = ? OR lower(n.name) = lower(?)${memberWhere}
+      ORDER BY ${symbolOrder(patterns ?? [])}
       LIMIT ?`,
     symbol, symbol, symbol,
+    ...(patterns ?? []),
     symbol, symbol, symbol,
+    ...(patterns ?? []),
     limit,
   ).map(toNode)
 }
@@ -85,6 +96,9 @@ export function search(db: DatabaseSync, request: CodegraphSearchRequest): Codeg
   const like = likeAnywhere(request.query)
   const kind = request.kind ?? null
   const language = request.language ?? null
+  // The subtree prefix a `path` restriction becomes: the model's directory, trailing slashes
+  // trimmed, as a literal prefix of the file path, so `_` and `%` in it match no extra files.
+  const path = request.path === undefined ? null : `${escapeLike(request.path.replace(/\/+$/, ''))}/%`
   const candidates = `
     FROM nodes n
     JOIN (
@@ -92,8 +106,9 @@ export function search(db: DatabaseSync, request: CodegraphSearchRequest): Codeg
       UNION
       SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?
     ) m ON m.rid = n.rowid
-    WHERE (? IS NULL OR n.kind = ?) AND (? IS NULL OR n.language = ?)`
-  const filters = [like, like, ftsPhrase(request.query), kind, kind, language, language]
+    WHERE (? IS NULL OR n.kind = ?) AND (? IS NULL OR n.language = ?)
+      AND (? IS NULL OR n.file_path LIKE ? ESCAPE '\\')`
+  const filters = [like, like, ftsPhrase(request.query), kind, kind, language, language, path, path]
   const total = scalar(db, `SELECT count(*) AS total ${candidates}`, ...filters)
   const matches = rows(
     db,
