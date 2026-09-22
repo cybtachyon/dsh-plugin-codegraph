@@ -1,6 +1,6 @@
 # @huanlin/dsh-plugin-codegraph-sqlite
 
-Read-only SQLite store for the code-graph seam. Serves structural queries from the graph at `.codegraph/codegraph.db` — the same on-disk format the `codegraph` CLI writes — opening it read-only and gating on its recorded format version. Reads schema v4 (what `@huanlin/dsh-plugin-codegraph-tree-sitter` builds) and schema v8 (what the `codegraph` CLI ≥1.5 writes); the queries touch only the tables both versions share.
+Read-only SQLite store for the code-graph seam. Serves structural queries from the graph at `.codegraph/codegraph.db` — the same on-disk format the `codegraph` CLI writes — opening it read-only and gating on its recorded format version. Reads schema v4 (what `@huanlin/dsh-plugin-codegraph-tree-sitter` builds) and schema v8/v9 (what the `codegraph` CLI ≥1.5/≥1.6 writes); the queries touch only the tables all versions share.
 
 Part of **[dsh-plugin-codegraph](https://github.com/CC19990113/dsh-plugin-codegraph)** — structural code intelligence for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 

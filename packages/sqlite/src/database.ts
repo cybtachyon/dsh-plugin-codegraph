@@ -26,13 +26,13 @@ export const DATABASE_RELATIVE_PATH = '.codegraph/codegraph.db'
  * is a fixed fact rather than a deployment choice; a database at any other version fails loud
  * instead of being read through assumptions that no longer hold.
  *
- * Two writers share this file, one per version: `@huanlin/dsh-plugin-codegraph-tree-sitter` builds schema v4,
- * and the `@colbymchenry/codegraph` CLI (≥1.5, whose daemon may own the same index) stamps schema
- * v8 — its `nodes`/`edges`/`files`/`nodes_fts` tables keep every column the store reads and only add
- * ones the store never touches (`unresolved_refs` is reshaped, `project_metadata` and
- * `name_segment_vocab` are new, and no store query reads any of the three).
+ * Two writers share this file, one per version: `@huanlin/dsh-plugin-codegraph-tree-sitter` builds
+ * schema v4, and the `@colbymchenry/codegraph` CLI (whose daemon may own the same index) stamps
+ * v8 (≥1.5) or v9 (≥1.6) — both keep `nodes`/`edges`/`files`/`nodes_fts` with every column the
+ * store reads and only add ones the store never touches (`unresolved_refs` is reshaped,
+ * `project_metadata` and `name_segment_vocab` are new, and no store query reads any of the three).
  */
-export const SUPPORTED_FORMAT_VERSIONS: readonly number[] = [4, 8]
+export const SUPPORTED_FORMAT_VERSIONS: readonly number[] = [4, 8, 9]
 
 /**
  * The absolute path of a project root's graph database.
@@ -117,11 +117,19 @@ export function openGraph(projectRoot: string): DatabaseSync {
   if (!SUPPORTED_FORMAT_VERSIONS.includes(version)) {
     db.close()
     throw new CodegraphError(
-      `the code graph at "${path}" is format version ${version}; this store reads version ${SUPPORTED_FORMAT_VERSIONS.join(' or ')}`,
+      `the code graph at "${path}" is format version ${version}; this store reads ${listVersions(SUPPORTED_FORMAT_VERSIONS)}. ` +
+        `It was written by a newer codegraph indexer than this store supports — rebuild the index with ` +
+        `codegraph_index (its indexer writes a version this store reads) or upgrade this store.`,
       'CODEGRAPH_UNSUPPORTED_FORMAT',
     )
   }
   return db
+}
+
+/** Format a supported-version list for an error message — "version 4" or "versions 4, 8, or 9". */
+function listVersions(versions: readonly number[]): string {
+  const last = versions[versions.length - 1]
+  return versions.length > 1 ? `versions ${versions.slice(0, -1).join(', ')}, or ${last}` : `version ${last}`
 }
 
 /** A pooled connection alongside the on-disk identity it was opened against. */

@@ -286,9 +286,9 @@ describe('result rendering', () => {
     })).toMatch(/Languages: none\.\nLast indexed: never\./)
   })
 
-  it('tells the model how to build a missing index rather than failing', () => {
+  it("points at the project's own root or an index build when the root has no index", () => {
     expect(renderCodegraph({ ...base, operation: 'status', indexed: false }))
-      .toBe('No index for `/repo`. Run codegraph_index to build one.')
+      .toBe("No index for `/repo`. If `/repo` is a container directory holding the project, pass the project's own root as project_path and retry; otherwise run codegraph_index on it to build one.")
   })
 
   it('treats a status answer with no languages array the same as an empty one', () => {
@@ -508,9 +508,25 @@ describe('the tool plugin', () => {
     const ctx = await mount(root)
     expect(ctx.tools.schemas().map(schema => schema.name)).toContain('codegraph')
     expect(ctx.tools.schemas().map(schema => schema.name)).toContain('codegraph_index')
-    const assembled = await ctx.systemPrompt.assemble()
-    expect(assembled.sections.map(section => section.text).join('\n'))
-      .toContain('Use codegraph for structural questions')
+    const text = (await ctx.systemPrompt.assemble()).sections.map(section => section.text).join('\n')
+    // The section is the reading-path rule: codegraph before bash introspection, grep as the
+    // literal-text fallback.
+    expect(text).toContain('Code structure is read with codegraph, not with bash')
+    expect(text).toContain("Never assume a symbol's properties, methods, or signature from memory")
+    expect(text).toContain("pass the project's own root as project_path and retry")
+    expect(text).toContain('Use grep as the fallback for literal text')
+  })
+
+  it('states the preference in both tool descriptions', async () => {
+    const root = await workspace()
+    const ctx = await mount(root)
+    const descriptions = Object.fromEntries(ctx.tools.schemas().map(schema => [schema.name, schema.description]))
+    expect(descriptions.codegraph).toContain('First source for questions about code structure')
+    expect(descriptions.codegraph).toContain('read this before writing a script to introspect code')
+    expect(descriptions.codegraph).toContain("pass the project's own root as project_path")
+    expect(descriptions.codegraph).toContain('call codegraph_index to build one, then retry')
+    expect(descriptions.codegraph_index).toContain('before falling back to grep or to an introspection script')
+    expect(descriptions.codegraph_index).toContain("Do not index a container directory that merely contains the project")
   })
 
   it('rejects "index" as an operation on the query tool', async () => {
@@ -691,7 +707,7 @@ describe('status against a root no store claims', () => {
     })
     expect(result.isError).toBe(false)
     const text = result.content.map(block => block.type === 'text' ? block.text : '').join('')
-    expect(text).toBe(`No index for \`${root}\`. Run codegraph_index to build one.`)
+    expect(text).toBe(`No index for \`${root}\`. If \`${root}\` is a container directory holding the project, pass the project's own root as project_path and retry; otherwise run codegraph_index on it to build one.`)
   })
 })
 

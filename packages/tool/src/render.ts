@@ -116,7 +116,7 @@ export function renderCodegraph(value: CodegraphToolValue): string {
     }
     case 'status': {
       if (!value.indexed) {
-        return `No index for \`${value.project_path}\`. Run codegraph_index to build one.`
+        return `No index for \`${value.project_path}\`. If \`${value.project_path}\` is a container directory holding the project, pass the project's own root as project_path and retry; otherwise run codegraph_index on it to build one.`
       }
       const languages = (value.languages ?? []).map(entry => `${entry.language} ${entry.file_count}`).join(', ')
       const indexedAt = value.indexed_at

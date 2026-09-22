@@ -87,6 +87,19 @@ describe('graph database', () => {
     db.close()
   })
 
+  it('serves a schema-v9 database the codegraph CLI ≥1.6 wrote', async () => {
+    // The CLI (≥1.6) stamps v9: same shared nodes/edges/files/fts shape as v8, plus the same
+    // unread tables. The fixture's stand-in keeps the shared tables and stamps v9, which is exactly
+    // the surface the store's SQL reaches.
+    const root = await project({ ...SEED, formatVersion: 9 })
+    const db = openGraph(root)
+    const summary = status(db, root, 100)
+    expect(summary.formatVersion).toBe(9)
+    expect(search(db, { operation: 'search', ...AT(root), query: 'helper', limit: 5 }).nodes.length)
+      .toBeGreaterThan(0)
+    db.close()
+  })
+
   it('refuses a graph that records no version at all', async () => {
     const root = await project({})
     const db = new DatabaseSync(databasePath(root))

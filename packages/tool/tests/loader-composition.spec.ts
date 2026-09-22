@@ -234,7 +234,7 @@ describe('tool-codegraph real Loader composition through cordis.yml', () => {
 
     const result = await call(ctx, owner, { operation: 'status', project_path: '/nonexistent/project' })
     expect(result.isError).toBe(false)
-    expect(resultText(result)).toBe('No index for `/nonexistent/project`. Run codegraph_index to build one.')
+    expect(resultText(result)).toBe("No index for `/nonexistent/project`. If `/nonexistent/project` is a container directory holding the project, pass the project's own root as project_path and retry; otherwise run codegraph_index on it to build one.")
   }, 30_000)
 
   it('fails loud on every other operation when no store indexes the requested project', async () => {
@@ -315,7 +315,7 @@ describe('codegraph_index real Loader composition through cordis.yml', () => {
 
     const before = await call(ctx, owner, { operation: 'status' }, 'before')
     expect(before.isError).toBe(false)
-    expect(resultText(before)).toBe(`No index for \`${root}\`. Run codegraph_index to build one.`)
+    expect(resultText(before)).toBe(`No index for \`${root}\`. If \`${root}\` is a container directory holding the project, pass the project's own root as project_path and retry; otherwise run codegraph_index on it to build one.`)
     await expect(access(databasePath)).rejects.toThrow()
 
     const indexResult = await ctx.tools.execute({

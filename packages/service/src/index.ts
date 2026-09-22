@@ -258,7 +258,12 @@ export class Codegraph extends Service implements CodegraphService {
     const claimants = candidates.filter((_, index) => claims[index])
     const [only, rival] = claimants
     if (only === undefined) {
-      throw new CodegraphError(`no code-graph store indexes "${projectRoot}"`, 'CODEGRAPH_UNAVAILABLE')
+      throw new CodegraphError(
+        `no code-graph store indexes "${projectRoot}" — no index exists at that root. ` +
+          `If the code is in a subdirectory of that root, pass the subdirectory's own root as project_path and retry; ` +
+          `otherwise build one with codegraph_index, then retry.`,
+        'CODEGRAPH_UNAVAILABLE',
+      )
     }
     if (rival !== undefined) {
       const ids = claimants.map(store => store.id).join(', ')

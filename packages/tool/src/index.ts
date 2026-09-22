@@ -64,9 +64,12 @@ export const DEFAULT_CODEGRAPH_TOOL_TIMEOUT_MS = 30_000
 /** Default timeout budget (ms) for the `codegraph_index` tool. Indexing a monorepo is a different order of work than a query. */
 export const DEFAULT_CODEGRAPH_INDEX_TIMEOUT_MS = 300_000
 
-/** The stable system-prompt guidance positioning the code graph against search and read. */
+/**
+ * The stable system-prompt preference rule: codegraph is the reading path for code structure —
+ * ahead of bash introspection and ahead of grep — with grep kept as the literal-text fallback.
+ */
 export const CODEGRAPH_PROMPT_TEXT =
-  'Use codegraph for structural questions about code: where a symbol is declared, what calls it, what it calls, what a change to it reaches, and how one symbol reaches another. It answers from a pre-built index, so it is both faster and more precise than grepping for a name, which also matches comments, strings, and unrelated identifiers. Use search/read instead for literal text, and when codegraph reports no index for a workspace. When status reports no index, call codegraph_index once to build one — it runs on its own, longer timeout budget than a query — then retry. Results reflect the last time the workspace was indexed; a declaration added since then is absent.'
+  'Code structure is read with codegraph, not with bash. Before writing a diagnostic or exploratory bash command or script (a `php -r` or property-dump script, for example) to inspect existing code, and before writing or editing code that depends on how existing symbols are shaped, read the real reference first: `codegraph node <symbol>` for one symbol with its relations and code, `search` for a name, `explore` or `context` for a task. Never assume a symbol\'s properties, methods, or signature from memory — codegraph matches declarations, not occurrences in comments or strings, and answers from a pre-built index where a script would re-implement introspection. bash is for running things — builds, tests, commands — not for reading structure. If codegraph reports no index for a root that is a container directory holding the project (a home or workspace directory), pass the project\'s own root as project_path and retry; run codegraph_index to build an index only when the project root itself has none — it runs on its own, longer timeout budget than a query — then retry. Use grep as the fallback for literal text, or for a declaration added after the last index. Results reflect the last time the workspace was indexed.'
 
 /** Plugin configuration: the defaults and caps the seam requires the consumer to own. */
 export interface Config {
@@ -181,12 +184,16 @@ export function apply(ctx: Context, config: Config): void {
   assertTimer('timeoutMs', resolved.timeoutMs)
   assertTimer('indexTimeoutMs', resolved.indexTimeoutMs)
 
-  ctx.systemPrompt.section({ name: 'tool:codegraph', order: 111, text: CODEGRAPH_PROMPT_TEXT })
+  // Order 1510: one slot after dsh-system-prompt's TOOL_GREP section (order
+  // 1500). The rule overrides the "Use the grep tool" imperative, so it must
+  // follow that line in the assembled prompt; the former 111 sat far before
+  // the tool cluster the model reads when choosing between search tools.
+  ctx.systemPrompt.section({ name: 'tool:codegraph', order: 1510, text: CODEGRAPH_PROMPT_TEXT })
 
   ctx.tools.register(defineTool({
     name: 'codegraph',
     description:
-      'Query a pre-built index of the workspace\'s declarations and their relationships. Find where a symbol is declared, what calls it, what it calls, what a change to it can affect, and how one symbol reaches another. More precise than text search: it matches declarations, not occurrences in comments or strings. Answers reflect the last time the workspace was indexed.',
+      'First source for questions about code structure: read this before writing a script to introspect code or before writing code that depends on existing symbols, and prefer it over grep. Query a pre-built index of the workspace\'s declarations and their relationships: where a symbol is declared (its code with include_code), what calls it, what it calls, what a change to it can affect, and how one symbol reaches another. It matches declarations, not occurrences in comments or strings. If it reports no index for a root that contains the project as a subdirectory, pass the project\'s own root as project_path; if the project root itself has no index, call codegraph_index to build one, then retry; use grep only as the fallback for literal text. Answers reflect the last time the workspace was indexed.',
     parameters: CODEGRAPH_PARAMETERS,
     output: {
       schema: CODEGRAPH_OUTPUT_SCHEMA,
@@ -207,7 +214,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'codegraph_index',
     description:
-      'Build or refresh the codegraph index for a workspace, so the codegraph tool can answer. Indexing a large workspace can take minutes, so this runs on its own timeout budget, separate from codegraph\'s query operations.',
+      'Build or refresh the codegraph index for a workspace, so the codegraph tool can answer. Call it when codegraph reports no index for the project\'s own root — before falling back to grep or to an introspection script — then retry codegraph. Do not index a container directory that merely contains the project; pass the project\'s own root instead. Indexing a large workspace can take minutes, so this runs on its own timeout budget, separate from codegraph\'s query operations.',
     parameters: CODEGRAPH_INDEX_PARAMETERS,
     output: {
       schema: CODEGRAPH_OUTPUT_SCHEMA,
