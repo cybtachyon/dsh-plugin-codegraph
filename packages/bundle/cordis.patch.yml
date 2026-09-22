@@ -24,7 +24,8 @@
     - id: codegraph-tree-sitter
       name: '@huanlin/dsh-plugin-codegraph-tree-sitter'
 
-    # Consumer: the model-facing `codegraph` and `codegraph_index` tools plus
-    # their system-prompt section.
+    # Consumer: the model-facing `codegraph` and `codegraph_index` tools, their
+    # system-prompt section, and the advisory nudge that reminds the model to
+    # call codegraph before reading code with bash (config `bashNudge`).
     - id: codegraph-tool
       name: '@huanlin/dsh-plugin-codegraph-tool'

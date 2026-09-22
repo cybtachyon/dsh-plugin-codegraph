@@ -117,6 +117,7 @@ The bundle mounts all four plugins in one layer. Retune any of them from the pro
   config:
     maxLimit: 50
     indexTimeoutMs: 600000
+    bashNudge: false # default true — the advisory reminder that points bash code-reading at codegraph
 ```
 
 ## Packages

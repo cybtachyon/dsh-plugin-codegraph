@@ -17,6 +17,11 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+// Type-only: pulls the `agent/pre-step` Events augmentation into this module's type context;
+// the import emits nothing, so the package gains no runtime dependency.
+import type {} from '@deepseek-ai/dsh-agent'
+import { createUserMessage } from '@deepseek-ai/dsh-llm/message'
+import type { UserMessage } from '@deepseek-ai/dsh-llm/message'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
@@ -35,6 +40,7 @@ import { CODEGRAPH_INDEX_PARAMETERS, CODEGRAPH_OUTPUT_SCHEMA, CODEGRAPH_PARAMETE
 import type { CodegraphIndexToolArgs, CodegraphToolArgs, CodegraphToolValue } from './schema.ts'
 import { readSlice } from './source.ts'
 import type { SourceLimits } from './source.ts'
+import { bashCommand, introspectionVerbs, nudgeSummary, nudgeText, type IndexAvailability } from './nudge.ts'
 
 export {
   CODEGRAPH_INDEX_PARAMETERS,
@@ -48,6 +54,18 @@ export {
   type CodegraphValueFor,
 } from './schema.ts'
 export { declarationsOnly, groupByFile, mergeByHits, mergeRelations, taskTerms } from './compose.ts'
+export {
+  bashCommand,
+  commandSegments,
+  isCodeFileToken,
+  isCodeIntrospectionCommand,
+  hasSearchTarget,
+  introspectionVerbs,
+  nudgeSummary,
+  nudgeText,
+  segmentIntrospectionVerb,
+  type IndexAvailability,
+} from './nudge.ts'
 export { toAffected, toHop, toRelation, toSymbol } from './projection.ts'
 export { renderCodegraph } from './render.ts'
 export { readSlice } from './source.ts'
@@ -65,11 +83,12 @@ export const DEFAULT_CODEGRAPH_TOOL_TIMEOUT_MS = 30_000
 export const DEFAULT_CODEGRAPH_INDEX_TIMEOUT_MS = 300_000
 
 /**
- * The stable system-prompt preference rule: codegraph is the reading path for code structure —
- * ahead of bash introspection and ahead of grep — with grep kept as the literal-text fallback.
+ * The stable system-prompt rule, stated as the imperative the sibling tool sections use:
+ * codegraph is the first attempt for code structure — ahead of bash and ahead of grep — with
+ * `codegraph_index` as the no-index procedure and the grep tool as the literal-text fallback.
  */
 export const CODEGRAPH_PROMPT_TEXT =
-  'Code structure is read with codegraph, not with bash. Before writing a diagnostic or exploratory bash command or script (a `php -r` or property-dump script, for example) to inspect existing code, and before writing or editing code that depends on how existing symbols are shaped, read the real reference first: `codegraph node <symbol>` for one symbol with its relations and code, `search` for a name, `explore` or `context` for a task. Never assume a symbol\'s properties, methods, or signature from memory — codegraph matches declarations, not occurrences in comments or strings, and answers from a pre-built index where a script would re-implement introspection. bash is for running things — builds, tests, commands — not for reading structure. If codegraph reports no index for a root that is a container directory holding the project (a home or workspace directory), pass the project\'s own root as project_path and retry; run codegraph_index to build an index only when the project root itself has none — it runs on its own, longer timeout budget than a query — then retry. Use grep as the fallback for literal text, or for a declaration added after the last index. Results reflect the last time the workspace was indexed.'
+  'Use the codegraph tool — not bash — to answer questions about the structure of existing code. Before running a bash command that reads, searches, or locates code (sed, cat, head, tail, grep, find, rg), call codegraph first: `codegraph node <symbol>` returns one symbol\'s declaration with its code and call relations, without needing the file\'s path; `search <name>` finds declarations by name; `explore <query>` and `context <task>` give a task-sized overview with source. It matches real declarations, never occurrences in comments or strings, and returns far less text than an unbounded sed or grep. Never assume a symbol\'s properties, method signatures, or existence — the index is the source of truth; a missing result means the symbol is not indexed, so fall back to the grep tool for literal text before concluding it does not exist. bash is for running things — builds, tests, commands — and the read tool is for when you need a whole file. If codegraph reports no index for a root that is a container directory holding the project (a home or workspace directory), pass the project\'s own root as project_path and retry; if the project root itself has no index, call codegraph_index to build one and then retry. Results reflect the last time the workspace was indexed.'
 
 /** Plugin configuration: the defaults and caps the seam requires the consumer to own. */
 export interface Config {
@@ -99,6 +118,12 @@ export interface Config {
   timeoutMs?: number
   /** Tool-call timeout budget in ms for the `codegraph_index` tool (default 300000). */
   indexTimeoutMs?: number
+  /**
+   * When true (default), a bash call that reads, searches, or locates code gets an advisory
+   * reminder attached to its own result, pointing at codegraph as the first attempt. The
+   * reminder fires at most a few times per agent run and never blocks or rewrites the call.
+   */
+  bashNudge?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -115,6 +140,7 @@ export const Config: z<Config> = z.object({
   maxContextTerms: z.number().default(6),
   timeoutMs: z.number().max(MAX_TIMER_DELAY_MS).default(DEFAULT_CODEGRAPH_TOOL_TIMEOUT_MS),
   indexTimeoutMs: z.number().max(MAX_TIMER_DELAY_MS).default(DEFAULT_CODEGRAPH_INDEX_TIMEOUT_MS),
+  bashNudge: z.boolean().default(true),
 })
 
 type ResolvedConfig = Required<Config>
@@ -193,7 +219,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'codegraph',
     description:
-      'First source for questions about code structure: read this before writing a script to introspect code or before writing code that depends on existing symbols, and prefer it over grep. Query a pre-built index of the workspace\'s declarations and their relationships: where a symbol is declared (its code with include_code), what calls it, what it calls, what a change to it can affect, and how one symbol reaches another. It matches declarations, not occurrences in comments or strings. If it reports no index for a root that contains the project as a subdirectory, pass the project\'s own root as project_path; if the project root itself has no index, call codegraph_index to build one, then retry; use grep only as the fallback for literal text. Answers reflect the last time the workspace was indexed.',
+      'First source for questions about code structure: call this before running bash (sed, cat, head, tail, grep, find) to read, search, or locate code, before writing a script to introspect code, and before writing code that depends on existing symbols, and prefer it over grep. Query a pre-built index of the workspace\'s declarations and their relationships: where a symbol is declared (its code with include_code), what calls it, what it calls, what a change to it can affect, and how one symbol reaches another. It matches declarations, not occurrences in comments or strings, and finds files whose path you do not know. If it reports no index for a root that contains the project as a subdirectory, pass the project\'s own root as project_path; if the project root itself has no index, call codegraph_index to build one, then retry; use grep only as the fallback for literal text. Answers reflect the last time the workspace was indexed.',
     parameters: CODEGRAPH_PARAMETERS,
     output: {
       schema: CODEGRAPH_OUTPUT_SCHEMA,
@@ -231,6 +257,104 @@ export function apply(ctx: Context, config: Config): void {
       rawInput: args,
     }),
   }))
+
+  if (resolved.bashNudge) installBashNudge(ctx)
+}
+
+/** One agent's in-flight bash-reading run: the call count and the index probe it triggered. */
+interface NudgeRun {
+  count: number
+  root: string | undefined
+  availability: IndexAvailability | undefined
+}
+
+/**
+ * The `tools/post-execute` side of the codegraph-first rule: a bash call that reads, searches, or
+ * locates code gets one advisory reminder attached to its own result, escalating at the configured
+ * run counts and capped so a heavy bash-style session is never flooded. A codegraph call (or a new
+ * user message, via `agent/pre-step`) resets the run, because the model has demonstrated the
+ * behavior the reminder asks for.
+ * @param ctx - the plugin context (must inject `tools` and `codegraph`).
+ */
+function installBashNudge(ctx: Context): void {
+  const runs = new WeakMap<object, NudgeRun>()
+
+  ctx.on('tools/post-execute', async (exec, _result, next) => {
+    const downstream = await next()
+    const nudge = await nudgeForCall(ctx, exec, runs)
+    if (nudge === undefined) return downstream
+    return {
+      ...downstream,
+      additionalContexts: [nudge, ...(downstream.additionalContexts ?? [])],
+    }
+  })
+
+  ctx.on('agent/pre-step', ({ agent, messages }, next) => {
+    if (messages.some(message => message.source.kind === 'user')) runs.delete(agent)
+    return next()
+  })
+}
+
+/**
+ * Decide whether one just-settled call carries a nudge, and build it: only `bash` calls whose
+ * command reads code qualify; the run counter decides the firing (thresholds), and the index
+ * probe decides the text. Codegraph calls reset the run instead of nudging.
+ * @param ctx - the plugin context (must inject `codegraph`).
+ * @param exec - the settled call.
+ * @param runs - per-agent run state.
+ * @returns the reminder message, or `undefined` when this call carries none.
+ */
+async function nudgeForCall(ctx: Context, exec: ToolExecution, runs: WeakMap<object, NudgeRun>): Promise<UserMessage | undefined> {
+  const agent = exec.agent
+  if (agent === undefined) return undefined
+  if (exec.name === 'codegraph' || exec.name === 'codegraph_index') {
+    runs.delete(agent)
+    return undefined
+  }
+  if (exec.name !== 'bash') return undefined
+  const command = bashCommand(exec.arguments)
+  if (command === undefined) return undefined
+  const verbs = introspectionVerbs(command)
+  if (verbs.length === 0) return undefined
+
+  let run = runs.get(agent)
+  if (run === undefined) {
+    run = { count: 0, root: sessionRoot(agent), availability: undefined }
+    runs.set(agent, run)
+  }
+  run.count += 1
+  if (!NUDGE_THRESHOLDS.includes(run.count)) return undefined
+  if (run.availability === undefined && run.root !== undefined) {
+    run.availability = await probeAvailability(ctx, run.root, exec.signal)
+  }
+  const availability = run.availability ?? 'unknown'
+  const verbList = verbs.join(', ')
+  return createUserMessage({
+    content: [{ type: 'text', text: nudgeText(run.count, availability, verbList) }],
+    source: {
+      kind: 'plugin',
+      plugin: 'codegraph',
+      form: 'notice',
+      summary: nudgeSummary(run.count, availability, verbList),
+    },
+  })
+}
+
+/** Run lengths at which the reminder fires; the run stops nudging past the last one. */
+const NUDGE_THRESHOLDS = [1, 3, 5, 8]
+
+/** The calling agent's session workspace — the root the index is probed at. */
+function sessionRoot(agent: NonNullable<ToolExecution['agent']>): string | undefined {
+  return agent.session.header.cwd
+}
+
+/** Whether the root has a codegraph index; probe failures degrade to `unknown`, never to a nudge veto. */
+async function probeAvailability(ctx: Context, root: string, signal: AbortSignal): Promise<IndexAvailability> {
+  try {
+    return (await ctx.codegraph.available(root, signal)) ? 'available' : 'missing'
+  } catch {
+    return 'unknown'
+  }
 }
 
 /**

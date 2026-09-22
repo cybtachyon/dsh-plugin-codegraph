@@ -1,7 +1,7 @@
 {
   "name": "@huanlin/dsh-plugin-codegraph-tool",
-  "version": "0.1.11",
-  "description": "Model-facing codegraph tools for DeepSeek Harness — a read-only codegraph tool with ten structural query operations plus a codegraph_index tool that builds or refreshes the index on its own timeout budget",
+  "version": "0.1.12",
+  "description": "Model-facing codegraph tools for DeepSeek Harness — a read-only codegraph tool with ten structural query operations, a codegraph_index tool on its own timeout budget, and an advisory reminder that points bash code-reading at codegraph",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -57,6 +57,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "0.1.5-rc.1",
     "@deepseek-ai/dsh-fs": "0.1.5-rc.1",
     "@deepseek-ai/dsh-llm": "0.1.5-rc.1",
     "@deepseek-ai/dsh-system-prompt": "0.1.5-rc.1",

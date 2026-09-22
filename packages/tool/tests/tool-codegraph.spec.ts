@@ -509,12 +509,13 @@ describe('the tool plugin', () => {
     expect(ctx.tools.schemas().map(schema => schema.name)).toContain('codegraph')
     expect(ctx.tools.schemas().map(schema => schema.name)).toContain('codegraph_index')
     const text = (await ctx.systemPrompt.assemble()).sections.map(section => section.text).join('\n')
-    // The section is the reading-path rule: codegraph before bash introspection, grep as the
-    // literal-text fallback.
-    expect(text).toContain('Code structure is read with codegraph, not with bash')
-    expect(text).toContain("Never assume a symbol's properties, methods, or signature from memory")
+    // The section is the imperative reading-path rule: codegraph before bash introspection, the
+    // index as source of truth, and grep as the literal-text fallback.
+    expect(text).toContain('Use the codegraph tool — not bash — to answer questions about the structure of existing code')
+    expect(text).toContain("call codegraph first")
+    expect(text).toContain("Never assume a symbol's properties, method signatures, or existence — the index is the source of truth")
     expect(text).toContain("pass the project's own root as project_path and retry")
-    expect(text).toContain('Use grep as the fallback for literal text')
+    expect(text).toContain('fall back to the grep tool for literal text')
   })
 
   it('states the preference in both tool descriptions', async () => {
@@ -522,7 +523,8 @@ describe('the tool plugin', () => {
     const ctx = await mount(root)
     const descriptions = Object.fromEntries(ctx.tools.schemas().map(schema => [schema.name, schema.description]))
     expect(descriptions.codegraph).toContain('First source for questions about code structure')
-    expect(descriptions.codegraph).toContain('read this before writing a script to introspect code')
+    expect(descriptions.codegraph).toContain('call this before running bash (sed, cat, head, tail, grep, find)')
+    expect(descriptions.codegraph).toContain('before writing a script to introspect code')
     expect(descriptions.codegraph).toContain("pass the project's own root as project_path")
     expect(descriptions.codegraph).toContain('call codegraph_index to build one, then retry')
     expect(descriptions.codegraph_index).toContain('before falling back to grep or to an introspection script')
