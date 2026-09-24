@@ -22,6 +22,22 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message'
 import type { UserMessage } from '@deepseek-ai/dsh-llm/message'
+/**
+ * Producer-owned source kind for the codegraph nudge. Session format v4 retired the
+ * v3 `kind: 'plugin'` wrapper (the v4 row admission refuses any message whose source kind
+ * is literally `'plugin'`), so the producer declares its own kind instead — the exact shape
+ * the released v3→v4 migration assigns to this plugin (`plugin:<name>` for an unlisted
+ * producer). The map key is the plugin id; the kind carries the `plugin:` namespace so the
+ * attribution stays readable in the durable log.
+ */
+declare module '@deepseek-ai/dsh-llm/message' {
+  // `ContextFormed` resolves in the augmented module's own scope.
+  interface MessageSourceMap {
+    codegraph: {
+      readonly kind: 'plugin:codegraph'
+    } & ContextFormed
+  }
+}
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
@@ -88,7 +104,7 @@ export const DEFAULT_CODEGRAPH_INDEX_TIMEOUT_MS = 300_000
  * `codegraph_index` as the no-index procedure and the grep tool as the literal-text fallback.
  */
 export const CODEGRAPH_PROMPT_TEXT =
-  'Use the codegraph tool — not bash — to answer questions about the structure of existing code. Before running a bash command that reads, searches, or locates code (sed, cat, head, tail, grep, find, rg), call codegraph first: `codegraph node <symbol>` returns one symbol\'s declaration with its code and call relations, without needing the file\'s path; `search <name>` finds declarations by name; `explore <query>` and `context <task>` give a task-sized overview with source. Write a symbol as the model writes it: a simple name (parse), a member as Class::member (Group::hasPermission), or the full qualified name a search returns — all three resolve. Name several identifiers space-separated in one search or explore call ("GroupType hasPlugin" finds both); a member written Class::member is searched as its parts. It matches real declarations, never occurrences in comments or strings, and returns far less text than an unbounded sed or grep. Never assume a symbol\'s properties, method signatures, or existence — the index is the source of truth; a missing result means the symbol is not indexed, so fall back to the grep tool for literal text before concluding it does not exist. bash is for running things — builds, tests, commands — and the read tool is for when you need a whole file. If codegraph reports no index for a root that is a container directory holding the project (a home or workspace directory), pass the project\'s own root as project_path and retry; if the project root itself has no index, call codegraph_index to build one and then retry. Results reflect the last time the workspace was indexed.'
+  'Use the codegraph tool — not bash — to answer questions about the structure of existing code. Before running a bash command that reads, searches, or locates code (sed, cat, head, tail, grep, find, rg), call codegraph first: `codegraph node <symbol>` returns one symbol\'s declaration with its code and call relations, without needing the file\'s path; `search <name>` finds declarations by name; `explore <query>` and `context <task>` give a task-sized overview with source. Write a symbol as the model writes it: a simple name (parse), a member as Class::member (Group::hasPermission), or the full qualified name a search returns — all three resolve. Name several identifiers space-separated in one search or explore call ("GroupType hasPlugin" finds both); a member written Class::member is searched as its parts. It matches real declarations, never occurrences in comments or strings, and returns far less text than an unbounded sed or grep. Never assume a symbol\'s properties, method signatures, or existence — the index is the source of truth; a missing result means the symbol is not indexed, so fall back to the grep tool for literal text before concluding it does not exist. bash is for running things — builds, tests, commands — and the read tool is for when you need a whole file. Omit project_path to query this session\'s workspace; its index covers the workspace\'s subdirectories, so do not pass a subdirectory of the session workspace as project_path (if you do, the answer still comes — from the nearest indexed ancestor, which the result names). If codegraph reports that no index exists anywhere up the tree from the root you gave, call codegraph_index with the root of the project you mean — its repository root, not a subdirectory of it — and then retry. Results reflect the last time the workspace was indexed.'
 
 /** Plugin configuration: the defaults and caps the seam requires the consumer to own. */
 export interface Config {
@@ -273,7 +289,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'codegraph',
     description:
-      'First source for questions about code structure: call this before running bash (sed, cat, head, tail, grep, find) to read, search, or locate code, before writing a script to introspect code, and before writing code that depends on existing symbols, and prefer it over grep. Query a pre-built index of the workspace\'s declarations and their relationships: where a symbol is declared (its code with include_code), what calls it, what it calls, what a change to it can affect, and how one symbol reaches another. It matches declarations, not occurrences in comments or strings, and finds files whose path you do not know. search and explore take one or more identifiers in a single call, space-separated ("GroupType hasPlugin" finds both, merged), and a member written Class::member or Class.member is searched as its parts; node and its friends take one symbol — a simple name, Class::member (Group::hasPermission), or the full qualified name a search returns. If it reports no index for a root that contains the project as a subdirectory, pass the project\'s own root as project_path; if the project root itself has no index, call codegraph_index to build one, then retry; use grep only as the fallback for literal text. Answers reflect the last time the workspace was indexed.',
+      'First source for questions about code structure: call this before running bash (sed, cat, head, tail, grep, find) to read, search, or locate code, before writing a script to introspect code, and before writing code that depends on existing symbols, and prefer it over grep. Query a pre-built index of the workspace\'s declarations and their relationships: where a symbol is declared (its code with include_code), what calls it, what it calls, what a change to it can affect, and how one symbol reaches another. It matches declarations, not occurrences in comments or strings, and finds files whose path you do not know. search and explore take one or more identifiers in a single call, space-separated ("GroupType hasPlugin" finds both, merged), and a member written Class::member or Class.member is searched as its parts; node and its friends take one symbol — a simple name, Class::member (Group::hasPermission), or the full qualified name a search returns. Omit project_path to query this session\'s workspace, whose index covers its subdirectories — pass it only for a different project; if the path you pass is not indexed on its own, the answer still comes, from the nearest indexed ancestor, and the result names it in resolution_note. If it reports no index anywhere up the tree from the root you gave, call codegraph_index with the root of the project you mean — its repository root, not a subdirectory of it — then retry; use grep only as the fallback for literal text. Answers reflect the last time the workspace was indexed.',
     parameters: CODEGRAPH_PARAMETERS,
     output: {
       schema: CODEGRAPH_OUTPUT_SCHEMA,
@@ -294,7 +310,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'codegraph_index',
     description:
-      'Build or refresh the codegraph index for a workspace, so the codegraph tool can answer. Call it when codegraph reports no index for the project\'s own root — before falling back to grep or to an introspection script — then retry codegraph. Do not index a container directory that merely contains the project; pass the project\'s own root instead. Indexing a large workspace can take minutes, so this runs on its own timeout budget, separate from codegraph\'s query operations.',
+      'Build or refresh the codegraph index for a workspace, so the codegraph tool can answer. Call it when codegraph reports that no index exists anywhere up the tree from the root you gave — before falling back to grep or to an introspection script — then retry codegraph. Index the project\'s own root: not a container directory that merely contains the project, and not a subdirectory of an already-indexed project (the codegraph tool answers subdirectory queries from the nearest indexed ancestor, so a nested index would only shadow it). Indexing a large workspace can take minutes, so this runs on its own timeout budget, separate from codegraph\'s query operations.',
     parameters: CODEGRAPH_INDEX_PARAMETERS,
     output: {
       schema: CODEGRAPH_OUTPUT_SCHEMA,
@@ -386,8 +402,7 @@ async function nudgeForCall(ctx: Context, exec: ToolExecution, runs: WeakMap<obj
   return createUserMessage({
     content: [{ type: 'text', text: nudgeText(run.count, availability, verbList) }],
     source: {
-      kind: 'plugin',
-      plugin: 'codegraph',
+      kind: 'plugin:codegraph',
       form: 'notice',
       summary: nudgeSummary(run.count, availability, verbList),
     },
@@ -476,6 +491,19 @@ async function runIndex(
 }
 
 /**
+ * The note a value carries when the requested root is not indexed on its own: it names both roots,
+ * so a model that pointed at a subdirectory sees exactly which index answered instead of assuming
+ * its own path was the index — and can re-aim follow-up calls at the named root.
+ * @param requested - the root the call resolved to before the seam looked.
+ * @param resolved - the root the seam's index actually lives at.
+ * @returns the note text, or `undefined` when the call was served from the root it named.
+ */
+function resolutionNote(requested: string, resolved: string): string | undefined {
+  if (requested === resolved) return undefined
+  return `Note: ${requested} is not indexed on its own, so this answer comes from the nearest indexed ancestor, ${resolved}.`
+}
+
+/**
  * Answer one tool call.
  * @param ctx - the plugin context.
  * @param config - the resolved plugin configuration.
@@ -489,7 +517,18 @@ async function run(
   args: CodegraphToolArgs,
   exec: ToolExecution,
 ): Promise<CodegraphToolValue> {
-  const root = projectRoot(args, exec)
+  // The root the call MEANT, before the seam resolves it: an explicit project_path, else the
+  // session workspace. Every query below passes it UNRESOLVED, so the seam's own routing decides
+  // the store, the index root, and the re-anchoring of any path/pattern filters — the seam is the
+  // single owner of that logic, and this call never corrupts it by pre-resolving.
+  const requested = projectRoot(args, exec)
+  // The root the seam actually serves: the requested one when a store indexes it, else the
+  // nearest indexed ancestor. This is what every SOURCE READ (node include_code, explore,
+  // context) must run against — an index's file paths live relative to the root it was built
+  // for, not the subdirectory a caller pointed at — and what the answer reports as project_path,
+  // with the note below explaining the difference whenever the two diverge.
+  const root = await ctx.codegraph.resolveRoot(requested, exec.signal)
+  const note = resolutionNote(requested, root)
   const limit = bounded(args.limit, config.defaultLimit, config.maxLimit)
   const depth = bounded(args.depth, config.defaultDepth, config.maxDepth)
   const projection: ProjectionLimits = {
@@ -501,12 +540,13 @@ async function run(
 
   switch (args.operation) {
     case 'search': {
-      const found = await searchTerms(ctx, root, required(args, 'query'), {
+      const found = await searchTerms(ctx, requested, required(args, 'query'), {
         ...args.kind === undefined ? {} : { kind: args.kind },
         ...args.language === undefined ? {} : { language: args.language },
         ...args.path === undefined ? {} : { path: args.path },
       }, limit, signal)
       return {
+        ...(note === undefined ? {} : { resolution_note: note }),
         operation: 'search',
         project_path: root,
         symbols: found.nodes.map(node => toSymbol(node, projection)),
@@ -517,7 +557,7 @@ async function run(
     case 'node': {
       const result = await ctx.codegraph.query({
         operation: 'node',
-        projectRoot: root,
+        projectRoot: requested,
         symbol: required(args, 'symbol'),
         limit,
       }, signal)
@@ -526,6 +566,7 @@ async function run(
         ? (await readSlice(ctx, root, result.node.filePath, result.node.startLine, result.node.endLine, source, signal)).code
         : null
       return {
+        ...(note === undefined ? {} : { resolution_note: note }),
         operation: 'node',
         project_path: root,
         symbol,
@@ -539,11 +580,12 @@ async function run(
     case 'callees': {
       const result = await ctx.codegraph.query({
         operation: args.operation,
-        projectRoot: root,
+        projectRoot: requested,
         symbol: required(args, 'symbol'),
         limit,
       }, signal)
       return {
+        ...(note === undefined ? {} : { resolution_note: note }),
         operation: args.operation,
         project_path: root,
         symbol: result.subject === null ? null : toSymbol(result.subject, projection),
@@ -555,12 +597,13 @@ async function run(
     case 'impact': {
       const result = await ctx.codegraph.query({
         operation: 'impact',
-        projectRoot: root,
+        projectRoot: requested,
         symbol: required(args, 'symbol'),
         depth,
         limit,
       }, signal)
       return {
+        ...(note === undefined ? {} : { resolution_note: note }),
         operation: 'impact',
         project_path: root,
         symbol: result.subject === null ? null : toSymbol(result.subject, projection),
@@ -572,13 +615,14 @@ async function run(
     case 'trace': {
       const result = await ctx.codegraph.query({
         operation: 'trace',
-        projectRoot: root,
+        projectRoot: requested,
         from: required(args, 'from'),
         to: required(args, 'to'),
         maxDepth: depth,
         maxPaths: config.maxPaths,
       }, signal)
       return {
+        ...(note === undefined ? {} : { resolution_note: note }),
         operation: 'trace',
         project_path: root,
         from: result.from === null ? null : toSymbol(result.from, projection),
@@ -589,12 +633,13 @@ async function run(
     case 'files': {
       const result = await ctx.codegraph.query({
         operation: 'files',
-        projectRoot: root,
+        projectRoot: requested,
         ...args.path === undefined ? {} : { path: args.path },
         ...args.pattern === undefined ? {} : { pattern: args.pattern },
         limit,
       }, signal)
       return {
+        ...(note === undefined ? {} : { resolution_note: note }),
         operation: 'files',
         project_path: root,
         files: result.files.map(file => ({
@@ -608,12 +653,13 @@ async function run(
       }
     }
     case 'status': {
-      const available = await ctx.codegraph.available(root, signal)
+      const available = await ctx.codegraph.available(requested, signal)
       if (!available) {
         return { operation: 'status', project_path: root, indexed: false }
       }
-      const result = await ctx.codegraph.query({ operation: 'status', projectRoot: root }, signal)
+      const result = await ctx.codegraph.query({ operation: 'status', projectRoot: requested }, signal)
       return {
+        ...(note === undefined ? {} : { resolution_note: note }),
         operation: 'status',
         project_path: root,
         indexed: true,
@@ -635,10 +681,11 @@ async function run(
       // caller wants source for, so the words are searched individually and merged — a single
       // substring match across the whole string finds nothing when the words name separate
       // declarations, which is the shape of every multi-identifier query.
-      const found = await searchTerms(ctx, root, required(args, 'query'), {}, limit, signal)
+      const found = await searchTerms(ctx, requested, required(args, 'query'), {}, limit, signal)
       const declarations = declarationsOnly(found.nodes)
       const groups = groupByFile(declarations, config.maxSourceFiles)
       return {
+        ...(note === undefined ? {} : { resolution_note: note }),
         operation: 'explore',
         project_path: root,
         files: await Promise.all(groups.map(group => explored(ctx, root, group, projection, source, signal))),
@@ -651,14 +698,15 @@ async function run(
       const terms = taskTerms(task, config.maxContextTerms)
       const batches = await Promise.all(terms.map(async term => (await ctx.codegraph.query({
         operation: 'search',
-        projectRoot: root,
+        projectRoot: requested,
         query: term,
         limit,
       }, signal)).nodes))
       const ranked = mergeByHits(batches.map(declarationsOnly), limit).map(scored => scored.node)
-      const related = await relatedTo(ctx, root, ranked, config, signal)
+      const related = await relatedTo(ctx, requested, ranked, config, signal)
       const groups = groupByFile(ranked, config.maxSourceFiles)
       return {
+        ...(note === undefined ? {} : { resolution_note: note }),
         operation: 'context',
         project_path: root,
         task,

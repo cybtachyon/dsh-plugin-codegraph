@@ -53,6 +53,10 @@ Separate from `codegraph` rather than an eleventh operation, because indexing a 
 
 Indexing is always explicit. No query ever triggers it implicitly: a `callers` call that silently took four minutes would be indistinguishable, to the model, from a hung tool.
 
+Index the **project root**, not a subdirectory of an already-indexed project: the query side already answers subdirectory calls from the nearest indexed ancestor (above), so a second index inside a subdirectory would only shadow it. And never a *container* directory that merely contains the project — the walk goes up, so an index one level too high still answers, but one that also swallows unrelated trees does not help anything.
+
+A call aimed at a **subdirectory of an indexed project is not a "no index"**: selection walks up from the named root to the nearest directory any store indexes and answers from that index, re-anchoring the call's `path`/`pattern` filters so they still match. A session whose workspace is `web/core` of an indexed repository therefore queries the repository's graph as-is, and the answer carries a `resolution_note` naming which root it came from, so the model never mistakes the index's paths for paths relative to the subdirectory it named. Only when no directory all the way up to the filesystem root is indexed does the no-index answer apply — and then the failure text points at the root of the project you mean, not at the subdirectory that was just tried.
+
 When no index exists, `status` answers plainly rather than failing — it says there is no index and names `codegraph_index` as the fix. Every other operation fails loudly instead, so an unindexed workspace is never mistaken for an empty one.
 
 ## Interoperability with the `codegraph` CLI

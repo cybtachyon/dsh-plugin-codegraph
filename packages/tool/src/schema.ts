@@ -151,6 +151,10 @@ function member<const O extends CodegraphToolOperation, const P extends Record<s
     properties: {
       operation: { type: 'string', required: true, const: operation },
       project_path: { type: 'string', required: true },
+      // Set only when the requested root is not itself indexed and the answer came from the
+      // nearest indexed ancestor: it names both roots, so a model that pointed at a subdirectory
+      // sees exactly which index answered instead of assuming its own path was the index.
+      resolution_note: { type: 'string' },
       ...properties,
     },
   } as const
@@ -266,7 +270,8 @@ export const CODEGRAPH_PARAMETERS = {
   include_code: { type: 'boolean', description: 'Include source text for node. explore and context always include it.' },
   project_path: {
     type: 'string',
-    description: 'Absolute path of another indexed project to query. Defaults to this session\'s workspace.',
+    description:
+      'Absolute path of a DIFFERENT project root to query — a project with its own index, other than this session\'s workspace. Omit it to query this session\'s workspace: that index covers the workspace\'s subdirectories, so do not pass a subdirectory of the session workspace. If you do pass a path that is not indexed on its own, the answer still comes — from the nearest indexed ancestor, which the result names in resolution_note.',
   },
 } as const
 
@@ -278,7 +283,8 @@ export const CODEGRAPH_PARAMETERS = {
 export const CODEGRAPH_INDEX_PARAMETERS = {
   project_path: {
     type: 'string',
-    description: 'Absolute path of the project to index. Defaults to this session\'s workspace.',
+    description:
+      'Absolute path of the project to index. Defaults to this session\'s workspace. Index the project\'s own root — not a container directory that merely contains the project, and not a subdirectory of an already-indexed project: the codegraph tool answers subdirectory queries from the nearest indexed ancestor, so a nested index would only shadow it.',
   },
 } as const
 

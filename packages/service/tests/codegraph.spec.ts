@@ -5,6 +5,7 @@ import Codegraph, {
   CodegraphIndexerId,
   CodegraphNodeId,
   CodegraphStoreId,
+  anchorPrefix,
   EDGE_KINDS,
   LANGUAGES,
   NODE_KINDS,
@@ -321,5 +322,215 @@ describe('codegraph availability', () => {
     const signal = new AbortController().signal
     await ctx.codegraph.available('/repo', signal)
     expect(indexes).toHaveBeenCalledWith('/repo', signal)
+  })
+})
+
+// A request aimed at a subdirectory of an indexed root must be answered from that root's index —
+// never bounced back at the caller with advice that repeats the call it just made.
+describe('codegraph ancestor resolution', () => {
+  it('serves a subdirectory query from the nearest indexed ancestor', async () => {
+    const ctx = await seam()
+    ctx.codegraph.registerStore(stubStore('a', ['/repo']))
+    const result = await ctx.codegraph.query({ operation: 'status', projectRoot: '/repo/sub' })
+    expect(result.projectRoot).toBe('a:/repo')
+  })
+
+  it('keeps an exact-root index ahead of an ancestor index', async () => {
+    const ctx = await seam()
+    ctx.codegraph.registerStore(stubStore('a', ['/repo/sub']))
+    ctx.codegraph.registerStore(stubStore('b', ['/repo']))
+    await expect(ctx.codegraph.query({ operation: 'status', projectRoot: '/repo/sub' }))
+      .resolves.toMatchObject({ projectRoot: 'a:/repo/sub' })
+    await expect(ctx.codegraph.query({ operation: 'status', projectRoot: '/repo/other' }))
+      .resolves.toMatchObject({ projectRoot: 'b:/repo' })
+  })
+
+  it('re-anchors path and pattern filters to the index root when routing to an ancestor', async () => {
+    const ctx = await seam()
+    const seen: CodegraphRequest[] = []
+    ctx.codegraph.registerStore({
+      id: CodegraphStoreId('spy'),
+      indexes: projectRoot => Promise.resolve(projectRoot === '/repo'),
+      query: request => {
+        seen.push(request)
+        return Promise.resolve(STATUS)
+      },
+    })
+    await ctx.codegraph.query({ operation: 'search', projectRoot: '/repo/sub', query: 'main', path: 'mod', limit: 5 })
+    await ctx.codegraph.query({ operation: 'files', projectRoot: '/repo/sub/deep', path: 'dir', pattern: 'x/*.ts', limit: 5 })
+    expect(seen[0]).toMatchObject({ operation: 'search', projectRoot: '/repo', path: 'sub/mod' })
+    expect(seen[1]).toMatchObject({ operation: 'files', projectRoot: '/repo', path: 'sub/deep/dir', pattern: 'sub/deep/x/*.ts' })
+    // A filter the caller did not set stays absent rather than arriving as `undefined`.
+    await ctx.codegraph.query({ operation: 'search', projectRoot: '/repo/sub', query: 'main', limit: 5 })
+    await ctx.codegraph.query({ operation: 'files', projectRoot: '/repo/sub/deep', path: 'dir', limit: 5 })
+    await ctx.codegraph.query({ operation: 'files', projectRoot: '/repo/sub/deep', pattern: 'x/*.ts', limit: 5 })
+    expect(seen[2]).toMatchObject({ operation: 'search', projectRoot: '/repo' })
+    expect(seen[2]).not.toHaveProperty('path')
+    expect(seen[3]).toMatchObject({ operation: 'files', projectRoot: '/repo', path: 'sub/deep/dir' })
+    expect(seen[3]).not.toHaveProperty('pattern')
+    expect(seen[4]).toMatchObject({ operation: 'files', projectRoot: '/repo', pattern: 'sub/deep/x/*.ts' })
+    expect(seen[4]).not.toHaveProperty('path')
+  })
+
+  it('strips a leading separator the caller wrote on a re-anchored filter', async () => {
+    const ctx = await seam()
+    const seen: CodegraphRequest[] = []
+    ctx.codegraph.registerStore({
+      id: CodegraphStoreId('spy'),
+      indexes: projectRoot => Promise.resolve(projectRoot === '/repo'),
+      query: request => {
+        seen.push(request)
+        return Promise.resolve(STATUS)
+      },
+    })
+    await ctx.codegraph.query({ operation: 'search', projectRoot: '/repo/sub', query: 'main', path: '/mod', limit: 5 })
+    expect(seen[0]).toMatchObject({ projectRoot: '/repo', path: 'sub/mod' })
+  })
+
+  it('does not re-anchor filters when the query is served from the exact root', async () => {
+    const ctx = await seam()
+    const seen: CodegraphRequest[] = []
+    ctx.codegraph.registerStore({
+      id: CodegraphStoreId('spy'),
+      indexes: projectRoot => Promise.resolve(projectRoot === '/repo'),
+      query: request => {
+        seen.push(request)
+        return Promise.resolve(STATUS)
+      },
+    })
+    const request = { operation: 'search', projectRoot: '/repo', query: 'main', path: 'mod', limit: 5 }
+    await ctx.codegraph.query(request)
+    expect(seen[0]).toMatchObject({ projectRoot: '/repo', path: 'mod' })
+  })
+
+  it('reports a conflict at the nearest indexed ancestor rather than skipping to a farther one', async () => {
+    const ctx = await seam()
+    ctx.codegraph.registerStore(stubStore('a', ['/repo']))
+    ctx.codegraph.registerStore(stubStore('b', ['/repo']))
+    ctx.codegraph.registerStore(stubStore('c', ['/']))
+    await expect(ctx.codegraph.query({ operation: 'status', projectRoot: '/repo/sub' }))
+      .rejects.toThrow(/several code-graph stores index "\/repo"/)
+  })
+
+  it('fails with build guidance when no ancestor is indexed', async () => {
+    const ctx = await seam()
+    ctx.codegraph.registerStore(stubStore('a', ['/elsewhere']))
+    await expect(ctx.codegraph.query({ operation: 'status', projectRoot: '/repo/sub' }))
+      .rejects.toThrow(/no code-graph store indexes "\/repo\/sub" or any ancestor directory/)
+    await expect(ctx.codegraph.query({ operation: 'status', projectRoot: '/repo/sub' }))
+      .rejects.toThrow(/Build one with codegraph_index/)
+  })
+
+  it('resolveRoot returns the requested root, the nearest indexed ancestor, or the request itself', async () => {
+    const ctx = await seam()
+    ctx.codegraph.registerStore(stubStore('a', ['/repo']))
+    expect(await ctx.codegraph.resolveRoot('/repo')).toBe('/repo')
+    expect(await ctx.codegraph.resolveRoot('/repo/sub')).toBe('/repo')
+    expect(await ctx.codegraph.resolveRoot('/elsewhere/sub')).toBe('/elsewhere/sub')
+  })
+
+  it('resolveRoot fails loudly on a conflicting candidate, like a query would', async () => {
+    const ctx = await seam()
+    ctx.codegraph.registerStore(stubStore('a', ['/repo']))
+    ctx.codegraph.registerStore(stubStore('b', ['/repo']))
+    await expect(ctx.codegraph.resolveRoot('/repo/sub')).rejects
+      .toThrow(expect.objectContaining<Partial<CodegraphError>>({ code: 'CODEGRAPH_CONFLICT' }))
+  })
+
+  it('reports available for a subdirectory of an indexed ancestor, not for an unindexed one', async () => {
+    const ctx = await seam()
+    ctx.codegraph.registerStore(stubStore('a', ['/repo']))
+    await expect(ctx.codegraph.available('/repo/sub')).resolves.toBe(true)
+    await expect(ctx.codegraph.available('/elsewhere/sub')).resolves.toBe(false)
+  })
+
+  it('stops the ancestor walk at its probe cap rather than reaching a far ancestor', async () => {
+    const ctx = await seam()
+    const probed: string[] = []
+    ctx.codegraph.registerStore({
+      id: CodegraphStoreId('spy'),
+      indexes: root => {
+        probed.push(root)
+        return Promise.resolve(root === '/a')
+      },
+      query: () => Promise.resolve(STATUS),
+    })
+    await expect(
+      ctx.codegraph.query({ operation: 'status', projectRoot: '/a/b/c/d/e/f/g/h/i/j/k/l/m/n' }),
+    ).rejects.toThrow(/no code-graph store indexes/)
+    // Thirteen probes: the requested root plus twelve ancestors, stopping one directory short of
+    // the index the store claims — a cap, not a silent miss of a plausible root.
+    expect(probed).toHaveLength(13)
+    expect(probed.at(-1)).toBe('/a/b')
+    expect(probed).not.toContain('/a')
+  })
+
+  it('stops a walk started from a relative path before the current directory', async () => {
+    const ctx = await seam()
+    const probed: string[] = []
+    ctx.codegraph.registerStore({
+      id: CodegraphStoreId('spy'),
+      indexes: root => {
+        probed.push(root)
+        return Promise.resolve(root === '.')
+      },
+      query: () => Promise.resolve(STATUS),
+    })
+    await expect(ctx.codegraph.query({ operation: 'status', projectRoot: 'a/b' })).rejects
+      .toThrow(/no code-graph store indexes/)
+    expect(probed).toEqual(['a/b', 'a'])
+  })
+
+  it('walks a trailing-slash request up without re-probing the same directory', async () => {
+    const ctx = await seam()
+    const probed: string[] = []
+    const seen: CodegraphRequest[] = []
+    ctx.codegraph.registerStore({
+      id: CodegraphStoreId('spy'),
+      indexes: root => {
+        probed.push(root)
+        return Promise.resolve(root === '/repo')
+      },
+      query: request => {
+        seen.push(request)
+        return Promise.resolve(STATUS)
+      },
+    })
+    await ctx.codegraph.query({ operation: 'search', projectRoot: '/repo/sub/', query: 'main', path: 'mod', limit: 5 })
+    expect(probed).toEqual(['/repo/sub/', '/repo'])
+    expect(seen[0]).toMatchObject({ projectRoot: '/repo', path: 'sub/mod' })
+  })
+
+  it('resolves and re-anchors Windows-style paths with the Windows rules', async () => {
+    const ctx = await seam()
+    const seen: CodegraphRequest[] = []
+    ctx.codegraph.registerStore({
+      id: CodegraphStoreId('spy'),
+      indexes: root => Promise.resolve(root === 'C:\\proj'),
+      query: request => {
+        seen.push(request)
+        return Promise.resolve(STATUS)
+      },
+    })
+    await ctx.codegraph.query({
+      operation: 'search', projectRoot: 'C:\\proj\\sub\\deep', query: 'main', path: 'mod', limit: 5,
+    })
+    expect(seen[0]).toMatchObject({ projectRoot: 'C:\\proj', path: 'sub\\deep\\mod' })
+    expect(await ctx.codegraph.resolveRoot('C:\\proj\\sub')).toBe('C:\\proj')
+  })
+})
+
+describe('anchorPrefix', () => {
+  it('joins the segment with the descendant path separator', () => {
+    expect(anchorPrefix('/repo', '/repo/sub')).toBe('sub/')
+    expect(anchorPrefix('/repo', '/repo/sub/deep')).toBe('sub/deep/')
+    expect(anchorPrefix('C:\\proj', 'C:\\proj\\sub')).toBe('sub\\')
+    expect(anchorPrefix('C:\\proj', 'C:\\proj\\sub\\deep')).toBe('sub\\deep\\')
+  })
+
+  it('throws on a pair that is not an ancestor relation', () => {
+    expect(() => anchorPrefix('/a', '/b')).toThrow(expect.objectContaining<Partial<CodegraphError>>({ code: 'CODEGRAPH_INTERNAL' }))
+    expect(() => anchorPrefix('/a', '/a')).toThrow(expect.objectContaining<Partial<CodegraphError>>({ code: 'CODEGRAPH_INTERNAL' }))
+    expect(() => anchorPrefix('/a/b', '/a/c')).toThrow(expect.objectContaining<Partial<CodegraphError>>({ code: 'CODEGRAPH_INTERNAL' }))
   })
 })

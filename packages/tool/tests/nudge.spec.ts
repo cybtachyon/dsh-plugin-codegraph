@@ -285,7 +285,7 @@ describe('the bash nudge waterfall', () => {
   }
 
   const nudgeOf = (result: { additionalContexts?: UserMessage[] }) =>
-    result.additionalContexts?.find(message => message.source.kind === 'plugin' && message.source.plugin === 'codegraph')
+    result.additionalContexts?.find(message => message.source.kind === 'plugin:codegraph')
 
   it('attaches a codegraph-first reminder to a structural bash call when an index exists', async () => {
     const root = await workspace({ 'src/App.php': 'x' })
@@ -294,7 +294,7 @@ describe('the bash nudge waterfall', () => {
     const result = await callBash(ctx, owner, 'sed -n \'/function access(/,/^  }/p\' web/core/lib/Drupal/Core/Entity/EntityAccessControlHandler.php | head -80', 'n-1')
     const nudge = nudgeOf(result)
     expect(nudge).toBeDefined()
-    expect(nudge?.source).toMatchObject({ kind: 'plugin', plugin: 'codegraph', form: 'notice' })
+    expect(nudge?.source).toMatchObject({ kind: 'plugin:codegraph', form: 'notice' })
     const text = nudge?.content.map(block => (block as { text?: string }).text ?? '').join('') ?? ''
     expect(text).toContain('call codegraph first')
     expect(text).toContain('sed')
@@ -412,7 +412,7 @@ describe('the bash nudge waterfall', () => {
     const result = await callBash(ctx, owner, 'cat web/modules/A.php', 'n-order')
     const contexts = result.additionalContexts ?? []
     expect(contexts.map(message => message.source)).toEqual([
-      { kind: 'plugin', plugin: 'codegraph', form: 'notice', summary: expect.any(String) },
+      { kind: 'plugin:codegraph', form: 'notice', summary: expect.any(String) },
       { kind: 'user' },
     ])
   })
@@ -535,5 +535,25 @@ describe('the bash nudge waterfall', () => {
       const result = await callBash(ctx, owner, `cat web/modules/F${call}.php`, `n-d-${call}`)
       expect(nudgeOf(result), `call ${call}`).toBeUndefined()
     }
+  })
+
+  it('reports the index available when the session sits in a subdirectory of an indexed root', async () => {
+    const root = await workspace()
+    const ctx = await mount(root, false)
+    // The mount's own store refuses every root, so only the walk up to the root can discover the
+    // index: a session whose workspace is the subdirectory must get the "use it" nudge, not
+    // "build one now" — the case that sends a model off building (or believing it needs) a second index.
+    ctx.codegraph.registerStore({
+      id: CodegraphStoreId('ancestor'),
+      indexes: projectRoot => Promise.resolve(projectRoot === root),
+      query: () => Promise.reject(new Error('not queried')),
+    })
+    const owner = agent(ctx, join(root, 'sub'))
+    const result = await callBash(ctx, owner, 'cat web/modules/A.php', 'n-anc')
+    const nudge = nudgeOf(result)
+    expect(nudge).toBeDefined()
+    const text = nudge?.content.map(block => (block as { text?: string }).text ?? '').join('') ?? ''
+    expect(text).toContain('call codegraph first')
+    expect(text).not.toContain('no codegraph index')
   })
 })

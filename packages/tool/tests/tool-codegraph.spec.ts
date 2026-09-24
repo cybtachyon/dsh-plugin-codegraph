@@ -9,6 +9,7 @@ import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent, Inbox } from '@deepseek-ai/dsh-agent'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import type { ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
 import Codegraph, { CodegraphIndexerId, CodegraphNodeId, CodegraphStoreId } from '@huanlin/dsh-plugin-codegraph-service'
 import type { CodegraphIndexReport, CodegraphNode, CodegraphRequest, CodegraphStoreProvider } from '@huanlin/dsh-plugin-codegraph-service'
@@ -528,7 +529,8 @@ describe('the tool plugin', () => {
     expect(text).toContain('Use the codegraph tool — not bash — to answer questions about the structure of existing code')
     expect(text).toContain("call codegraph first")
     expect(text).toContain("Never assume a symbol's properties, method signatures, or existence — the index is the source of truth")
-    expect(text).toContain("pass the project's own root as project_path and retry")
+    expect(text).toContain("do not pass a subdirectory of the session workspace as project_path")
+    expect(text).toContain("call codegraph_index with the root of the project you mean — its repository root, not a subdirectory of it — and then retry")
     expect(text).toContain('fall back to the grep tool for literal text')
   })
 
@@ -539,10 +541,11 @@ describe('the tool plugin', () => {
     expect(descriptions.codegraph).toContain('First source for questions about code structure')
     expect(descriptions.codegraph).toContain('call this before running bash (sed, cat, head, tail, grep, find)')
     expect(descriptions.codegraph).toContain('before writing a script to introspect code')
-    expect(descriptions.codegraph).toContain("pass the project's own root as project_path")
-    expect(descriptions.codegraph).toContain('call codegraph_index to build one, then retry')
+    expect(descriptions.codegraph).toContain("Omit project_path to query this session's workspace, whose index covers its subdirectories")
+    expect(descriptions.codegraph).toContain('if the path you pass is not indexed on its own, the answer still comes, from the nearest indexed ancestor, and the result names it in resolution_note')
+    expect(descriptions.codegraph).toContain('call codegraph_index with the root of the project you mean — its repository root, not a subdirectory of it — then retry')
     expect(descriptions.codegraph_index).toContain('before falling back to grep or to an introspection script')
-    expect(descriptions.codegraph_index).toContain("Do not index a container directory that merely contains the project")
+    expect(descriptions.codegraph_index).toContain("not a container directory that merely contains the project, and not a subdirectory of an already-indexed project")
   })
 
   it('rejects "index" as an operation on the query tool', async () => {
@@ -1089,5 +1092,176 @@ describe('rendering permutations of an otherwise identical answer', () => {
       files: [{ path: 'a.ts', symbols: [], code: 'x', truncated: true }],
     })
     expect(text).toContain('(source truncated)')
+  })
+})
+
+// The failure this exists to prevent: a model that points the tool at a SUBDIRECTORY of an
+// indexed project used to get an error whose advice repeated the exact call it had just made,
+// and then abandoned the tool for the rest of the session. Every test below calls through the
+// full tool surface (schema validation, seam, render) with a store that claims one explicit root.
+describe('subdirectory resolution', () => {
+  const seen: CodegraphRequest[] = []
+
+  async function mount(root: string, claimed: readonly string[]): Promise<Context> {
+    seen.length = 0
+    const ctx = new Context()
+    context = ctx
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(LocalFileSystem, { cwd: root })
+    await ctx.plugin(Codegraph)
+    const store: CodegraphStoreProvider = {
+      id: CodegraphStoreId('stub'),
+      indexes: projectRoot => Promise.resolve(claimed.includes(projectRoot)),
+      query: ((request: CodegraphRequest) => {
+        seen.push(request)
+        const answer = request.operation === 'status'
+          ? {
+              kind: 'status', projectRoot: request.projectRoot, fileCount: 1, nodeCount: 1, edgeCount: 0,
+              languages: [{ language: 'typescript', fileCount: 1 }], formatVersion: 4, indexedAt: null,
+              staleFileCount: 0, staleFileCountTruncated: false,
+            }
+          : request.operation === 'search'
+            ? { kind: 'search', nodes: [graphNode()], total: 1, truncated: false }
+            : request.operation === 'files'
+              ? { kind: 'files', total: 0, truncated: false, files: [] }
+              : request.operation === 'callers' || request.operation === 'callees'
+                ? { kind: request.operation, subject: null, relations: [], total: 0, truncated: false }
+                : request.operation === 'impact'
+                  ? { kind: 'impact', subject: null, entries: [], total: 0, truncated: false }
+                  : request.operation === 'trace'
+                    ? { kind: 'trace', from: null, to: null, paths: [] }
+                    : { kind: 'node', node: graphNode(), incoming: [], outgoing: [], alternatives: [] }
+        return Promise.resolve(answer)
+      }) as CodegraphStoreProvider['query'],
+    }
+    ctx.codegraph.registerStore(store)
+    await ctx.plugin(ToolCodegraph)
+    return ctx
+  }
+
+  function agent(ctx: Context, cwd: string): Agent {
+    const scope = ctx.plugin(() => {})
+    const id = SessionId('codegraph-subdir')
+    const session = Session.create(id, [], { version: SESSION_FORMAT_VERSION, id, createdAt: 0, cwd, isSeeded: false })
+    const value: Agent = {
+      id, options: {}, session,
+      inbox: stubInbox(),
+      status: 'idle', ctx: scope.ctx,
+      followup: () => {}, steer: () => {}, inject: () => {}, send: () => {}, cancel() {},
+      runMaintenance: task => task(new AbortController().signal),
+      whenIdle: () => Promise.resolve(),
+    }
+    ctx.agents.register(value)
+    return value
+  }
+
+  async function call(ctx: Context, owner: Agent, args: Record<string, unknown>, id = 'unit'): Promise<ToolExecutionResult> {
+    return ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId(id),
+      name: 'codegraph',
+      arguments: args,
+      agent: owner,
+    })
+  }
+
+  const textOf = (result: Awaited<ReturnType<typeof call>>) =>
+    result.content.map(block => block.type === 'text' ? block.text : '').join('')
+
+  it('answers a subdirectory query from the nearest indexed ancestor, says so, and reads source from that root', async () => {
+    const root = await workspace({ 'app.ts': 'function main() {\n  return 1\n}\n' })
+    const ctx = await mount(root, [root])
+    const owner = agent(ctx, root)
+    const result = await call(ctx, owner, {
+      operation: 'node', symbol: 'main', include_code: true, project_path: join(root, 'sub'),
+    })
+    expect(result.isError).toBe(false)
+    const text = textOf(result)
+    expect(text).toMatch(
+      new RegExp(`^Note: ${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/sub is not indexed on its own, so this answer comes from the nearest indexed ancestor, ${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.`),
+    )
+    // A source read resolved against the subdirectory the caller named would have come back
+    // "source unavailable for app.ts": the read must run against the index root instead.
+    expect(text).toContain('function main() {')
+    expect(text).not.toContain('source unavailable')
+    expect(seen.at(-1)).toMatchObject({ operation: 'node', projectRoot: root })
+  })
+
+  it('keeps an exact-root index ahead of the ancestor index', async () => {
+    const root = await workspace()
+    const sub = join(root, 'sub')
+    const ctx = await mount(root, [root, sub])
+    const owner = agent(ctx, root)
+    await call(ctx, owner, { operation: 'node', symbol: 'main', project_path: sub })
+    expect(seen.at(-1)).toMatchObject({ projectRoot: sub })
+    expect(textOf(await call(ctx, owner, { operation: 'node', symbol: 'main', project_path: sub }))).not.toContain('Note:')
+    await call(ctx, owner, { operation: 'node', symbol: 'main', project_path: root })
+    expect(seen.at(-1)).toMatchObject({ projectRoot: root })
+  })
+
+  it('re-anchors path and pattern filters to the index root when routing to an ancestor', async () => {
+    const root = await workspace()
+    const ctx = await mount(root, [root])
+    const owner = agent(ctx, root)
+    await call(ctx, owner, { operation: 'search', query: 'main', path: 'src', project_path: join(root, 'sub') })
+    await call(ctx, owner, { operation: 'files', path: 'src', pattern: 'p/*.ts', project_path: join(root, 'sub', 'deep') })
+    expect(seen[0]).toMatchObject({ operation: 'search', projectRoot: root, path: 'sub/src' })
+    expect(seen[1]).toMatchObject({ operation: 'files', projectRoot: root, path: 'sub/deep/src', pattern: 'sub/deep/p/*.ts' })
+  })
+
+  it('reports status from the nearest indexed ancestor for an unindexed subdirectory', async () => {
+    const root = await workspace()
+    const ctx = await mount(root, [root])
+    const owner = agent(ctx, root)
+    const result = await call(ctx, owner, { operation: 'status', project_path: join(root, 'sub') })
+    expect(result.isError).toBe(false)
+    const text = textOf(result)
+    expect(text).toContain('is not indexed on its own')
+    expect(text).toContain(`Index for ${root} (format version 4)`)
+  })
+
+  it('keeps indexed:false when no ancestor is indexed', async () => {
+    const root = await workspace()
+    const ctx = await mount(root, [join('/elsewhere', 'x')])
+    const owner = agent(ctx, root)
+    const result = await call(ctx, owner, { operation: 'status' })
+    expect(textOf(result)).toBe(
+      `No index for \`${root}\`. If \`${root}\` is a container directory holding the project, pass the project's own root as project_path and retry; otherwise run codegraph_index on it to build one.`,
+    )
+  })
+
+  it('fails loud on every other operation when no ancestor is indexed', async () => {
+    const root = await workspace()
+    const ctx = await mount(root, [join('/elsewhere', 'x')])
+    const owner = agent(ctx, root)
+    const result = await call(ctx, owner, { operation: 'search', query: 'main', project_path: join(root, 'sub') })
+    expect(result.isError).toBe(true)
+    const text = textOf(result)
+    expect(text).toContain('no code-graph store indexes')
+    expect(text).toContain('or any ancestor directory')
+    expect(text).toContain('Build one with codegraph_index')
+  })
+
+  it('carries the resolution note on the remaining operations too', async () => {
+    const root = await workspace({ 'app.ts': 'function main() {\n  return 1\n}\n' })
+    const ctx = await mount(root, [root])
+    const owner = agent(ctx, root)
+    const calls: Record<string, Record<string, unknown>> = {
+      callers: { operation: 'callers', symbol: 'main', project_path: join(root, 'sub') },
+      callees: { operation: 'callees', symbol: 'main', project_path: join(root, 'sub') },
+      impact: { operation: 'impact', symbol: 'main', project_path: join(root, 'sub') },
+      trace: { operation: 'trace', from: 'main', to: 'other', project_path: join(root, 'sub') },
+      explore: { operation: 'explore', query: 'main', project_path: join(root, 'sub') },
+      context: { operation: 'context', task: 'fix main', project_path: join(root, 'sub') },
+    }
+    for (const [operation, args] of Object.entries(calls)) {
+      const result = await call(ctx, owner, args, `sub-${operation}`)
+      const text = textOf(result)
+      expect(result.isError, operation).toBe(false)
+      expect(text, operation).toContain('is not indexed on its own')
+      expect(text, operation).toContain(`nearest indexed ancestor, ${root}`)
+    }
   })
 })

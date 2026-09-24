@@ -496,13 +496,26 @@ export interface CodegraphService {
    */
   registerIndexer(provider: CodegraphIndexer): () => void
   /**
-   * Whether any registered store already claims `projectRoot`, without opening it. Lets a caller
+   * Whether a query against `projectRoot` can be answered without a build, without opening any
+   * index: true when a store indexes the root itself or one of its ancestor directories (the
+   * nearest such index serves it), false when nothing up the tree carries an index. Lets a caller
    * distinguish "not indexed" from "query failed" without catching {@link query}'s error.
    * @param projectRoot - absolute path of the project root to check.
    * @param signal - aborts the check.
-   * @returns true when {@link query} can serve this root right now.
+   * @returns true when {@link query} can serve this root or an ancestor of it right now.
    */
   available(projectRoot: string, signal?: AbortSignal): Promise<boolean>
+  /**
+   * The root a query against `projectRoot` would be served from: the requested root when a store
+   * indexes it, the nearest indexed ancestor directory otherwise, and the requested root unchanged
+   * when no ancestor is indexed — a caller compares the answer with its request to tell the three
+   * cases apart. The store that would answer is never opened, and a candidate several stores claim
+   * fails loudly with the same conflict a query would raise.
+   * @param projectRoot - absolute path to resolve.
+   * @param signal - aborts the availability checks.
+   * @returns the root to run the query — and any source reads keyed to it — against.
+   */
+  resolveRoot(projectRoot: string, signal?: AbortSignal): Promise<string>
   /**
    * Run the single indexer that claims `projectRoot`.
    * @param projectRoot - absolute path of the project root to index.
@@ -519,7 +532,12 @@ export interface CodegraphService {
    */
   release(projectRoot: string): void
   /**
-   * Route one query to the store that indexes `request.projectRoot`.
+   * Route one query to the store that serves `request.projectRoot`: the store that indexes the
+   * requested root when one does, else the single store indexing the nearest ancestor directory,
+   * so a query aimed at a subdirectory of an indexed project is answered from that project's index
+   * (its `path`/`pattern` filters arrive re-anchored to the index root; the result's
+   * {@link CodegraphStatusResult.projectRoot} and the caller's own bookkeeping name the root that
+   * answered). Only when no ancestor is indexed at all does the call fail.
    * @param request - the normalized query.
    * @param signal - aborts store selection and the query.
    * @returns the result member matching `request.operation`.

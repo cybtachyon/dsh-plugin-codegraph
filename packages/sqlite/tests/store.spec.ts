@@ -1,4 +1,5 @@
-import { rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -630,12 +631,26 @@ describe('the store plugin', () => {
       .toMatchObject({ kind: 'files' })
   })
 
-  it('claims only roots that carry a graph', async () => {
+  it('serves a subdirectory query from the graph of the nearest indexed ancestor', async () => {
     const root = await project(SEED)
     const ctx = await mount()
     await expect(ctx.codegraph.query({ operation: 'status', projectRoot: root })).resolves.toBeDefined()
+    // A subdirectory of an indexed root is served from that root's graph; the status echoes the
+    // index root that answered, not the subdirectory the caller named.
     await expect(ctx.codegraph.query({ operation: 'status', projectRoot: join(root, 'nowhere') }))
-      .rejects.toThrow(/no code-graph store indexes/)
+      .resolves.toMatchObject({ projectRoot: root })
+  })
+
+  it('fails loud when neither the root nor any ancestor carries a graph', async () => {
+    await project(SEED)
+    const ctx = await mount()
+    const foreign = await mkdtemp(join(tmpdir(), 'dsh-codegraph-foreign-'))
+    try {
+      await expect(ctx.codegraph.query({ operation: 'status', projectRoot: foreign }))
+        .rejects.toThrow(/no code-graph store indexes/)
+    } finally {
+      await rm(foreign, { recursive: true, force: true })
+    }
   })
 
   it('takes its store id from configuration', async () => {

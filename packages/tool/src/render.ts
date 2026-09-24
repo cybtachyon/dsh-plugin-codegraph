@@ -66,13 +66,21 @@ function noMatchGuidance(operation: CodegraphToolValue['operation'], subject: st
 }
 
 /**
- * Render one result as the text the model reads.
+ * Render one result as the text the model reads. When the value carries a `resolution_note`
+ * (the requested root was not indexed on its own and an ancestor's index answered), the note
+ * leads the text: a model that pointed at a subdirectory must see which index actually answered,
+ * or it will keep "fixing" a call that was never the problem.
  * @param value - the canonical value the operation returned.
  * @param subject - the text the model asked for (query, symbol, or endpoints), so an empty answer
  * can name it and point at the retry that resolves it; the tool's render callback supplies it.
  * @returns the rendered text.
  */
 export function renderCodegraph(value: CodegraphToolValue, subject?: string): string {
+  const text = renderResult(value, subject)
+  return value.resolution_note === undefined ? text : `${value.resolution_note}\n${text}`
+}
+
+function renderResult(value: CodegraphToolValue, subject?: string): string {
   const empty = () => `No declaration matches${subject === undefined ? '' : ` "${subject}"`} in ${value.project_path}.${noMatchGuidance(value.operation, subject)}`
   switch (value.operation) {
     case 'search': {
